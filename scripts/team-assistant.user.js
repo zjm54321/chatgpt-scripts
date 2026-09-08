@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Team 助手
 // @namespace    https://github.com/zjm54321/chatgpt-scripts
-// @version      v2026.09.07-3
-// @description  成员席位历史、用量额度统计与历史账单查询，隐藏指定用量提醒；不修改额度或计费设置。
+// @version      v2026.09.08-1
+// @description  官方下期账单读取、用量额度统计与席位历史提醒；不修改额度或计费设置。
 // @author       zjm54321
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
+// @match        https://pay.openai.com/*
 // @grant        none
 // @run-at       document-start
 // @noframes
@@ -15,14 +16,11 @@
 // @updateURL    https://raw.githubusercontent.com/zjm54321/chatgpt-scripts/main/scripts/team-assistant.user.js
 // ==/UserScript==
 
-(() => {
-    "use strict";
-
-    // Idempotent singleton guard
-    if (window.__CHATGPT_TEAM_ASSISTANT__) return;
-    window.__CHATGPT_TEAM_ASSISTANT__ = true;
-
-function createSeatHistoryMonitor(onChange) {
+(() => { "use strict";
+if(location.origin==='https://pay.openai.com') { if(window.top!==window.self || window.__CHATGPT_TEAM_BILLING_READER__) return; window.__CHATGPT_TEAM_BILLING_READER__=true; runOfficialBillingReader(); return; }
+if(location.origin!=='https://chatgpt.com' && location.origin!=='https://chat.openai.com') return;
+if(window.__CHATGPT_TEAM_ASSISTANT__)return;window.__CHATGPT_TEAM_ASSISTANT__=true;
+function createSeatHistoryMonitor(onChange, onPolicyNotice) {
   'use strict';
 
   var HISTORY_KEY = 'codex:chatgpt-vacancy-monitor:v1';
@@ -229,6 +227,28 @@ function createSeatHistoryMonitor(onChange) {
     }
   }
 
+  function notifyPolicy(accountId, userId, capturedAt, values) {
+    if (destroyed || typeof onPolicyNotice !== 'function') return;
+    refreshAccountId();
+    if (activeAccountId !== accountId) return;
+    try {
+      onPolicyNotice({
+        accountId: accountId,
+        userId: userId,
+        capturedAt: capturedAt,
+        policy: {
+          vacancyOrdinal: values.vacancyOrdinal,
+          freeVacancyThreshold: values.freeVacancyThreshold,
+          billingStartsAt: values.billingStartsAt,
+          expiresAt: values.expiresAt
+        },
+        saved: true
+      });
+    } catch (_) {
+      // The host callback is never allowed to affect page behavior.
+    }
+  }
+
   function serialize(task) {
     function run() {
       var locks = win && win.navigator && win.navigator.locks;
@@ -251,7 +271,7 @@ function createSeatHistoryMonitor(onChange) {
       Object.is(left.expiresAt, right.expiresAt);
   }
 
-  function appendPolicy(accountId, userId, values) {
+  function appendPolicy(accountId, userId, values, shouldNotifyPolicy) {
     return serialize(function () {
       if (destroyed) return { ok: false, changed: false };
       var stored = readStoredObject(HISTORY_KEY);
@@ -274,18 +294,22 @@ function createSeatHistoryMonitor(onChange) {
       };
       if (samePolicy(lastValues, values)) return { ok: true, changed: false };
 
+      var capturedAt = new Date().toISOString();
       history.push({
-        capturedAt: new Date().toISOString(),
+        capturedAt: capturedAt,
         vacancyOrdinal: values.vacancyOrdinal,
         freeVacancyThreshold: values.freeVacancyThreshold,
         billingStartsAt: values.billingStartsAt,
         expiresAt: values.expiresAt
       });
       defineOwn(records, key, { accountId: accountId, userId: userId, history: history });
-      return { ok: saveStoredObject(HISTORY_KEY, records), changed: true };
+      return { ok: saveStoredObject(HISTORY_KEY, records), changed: true, capturedAt: capturedAt };
     }).then(function (result) {
       if (!result.ok) notify();
-      else if (result.changed) notify();
+      else if (result.changed) {
+        notify();
+        if (shouldNotifyPolicy && !destroyed) notifyPolicy(accountId, userId, result.capturedAt, values);
+      }
       return result.ok;
     }, function () {
       noteSaveFailure();
@@ -479,7 +503,7 @@ function createSeatHistoryMonitor(onChange) {
       return;
     }
     var values = policyValues(payload);
-    if (values) appendPolicy(target.accountId, target.userId, values);
+    if (values) appendPolicy(target.accountId, target.userId, values, payload.policy_notice !== null);
   }
 
   function fetchTarget(args) {
@@ -717,6 +741,7 @@ function createSeatHistoryMonitor(onChange) {
   };
 }
 
+
 function mountSeatHistoryPanel(options) {
     'use strict';
     options = options || {};
@@ -741,10 +766,12 @@ function mountSeatHistoryPanel(options) {
     for (var p = 0; p < oldPanelHosts.length; p++) {
         oldPanelHosts[p].remove();
     }
+
     var ICONS = {
         contacts: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 2v2m1.915 17a6 6 0 1 0-12 0M8 2v2"/><circle cx="12" cy="11" r="4"/><rect width="18" height="18" x="3" y="3" rx="2"/></svg>',
         close: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
     };
+
     var THEME_CSS = `
         :host {
             --cg-sh-bg-popover: #ffffff; --cg-sh-bg-secondary: #f7f7f8;
@@ -780,6 +807,7 @@ function mountSeatHistoryPanel(options) {
         if (parent) parent.appendChild(node);
         return node;
     }
+
     // 1. Button Host inside native header action group
     var btnHost = document.createElement('div');
     btnHost.id = '__chatgpt_team_seat_history_btn_host__';
@@ -809,6 +837,7 @@ function mountSeatHistoryPanel(options) {
             .cg-sh-btn { transition: none !important; }
         }`;
     btnShadow.appendChild(btnStyle);
+
     var btn = el('button', 'cg-sh-btn', null, btnShadow, {
         type: 'button', id: 'cg-sh-trigger-btn', 'aria-label': '席位阈值历史',
         title: '席位阈值历史', 'aria-haspopup': 'dialog', 'aria-expanded': 'false',
@@ -816,6 +845,7 @@ function mountSeatHistoryPanel(options) {
     });
     var iconSlot = el('span', 'cg-sh-icon-slot', null, btn);
     iconSlot.innerHTML = ICONS.contacts;
+
     // 2. Portalled Popover Host in document.body
     var panelHost = document.createElement('div');
     panelHost.id = '__chatgpt_team_seat_history_panel_host__';
@@ -921,19 +951,21 @@ function mountSeatHistoryPanel(options) {
     var clearBtn = el('button', 'cg-sh-clear-btn', '清空当前记录', actionsEl, {
         type: 'button', title: '清空当前工作空间的历史记录', disabled: true
     });
-
     var closeBtn = el('button', 'cg-sh-close-btn', null, actionsEl, {
         type: 'button', 'aria-label': '关闭', title: '关闭'
     });
     closeBtn.innerHTML = ICONS.close;
+
     var wsBar = el('div', 'cg-sh-workspace-bar', null, headerEl);
     el('span', 'cg-sh-ws-label', '工作空间', wsBar);
     var wsIdEl = el('span', 'cg-sh-ws-id', '未识别', wsBar);
     var errorBar = el('div', 'cg-sh-error-bar', null, headerEl, {
         role: 'alert', 'aria-live': 'polite', hidden: true
     });
+
     var bodyEl = el('div', 'cg-sh-body', null, popover);
     el('div', 'cg-sh-footer', '仅记录页面操作返回的变化，历史保存在本浏览器。', popover);
+
     // Helpers
     function isMembersRoute() {
         try {
@@ -965,6 +997,7 @@ function mountSeatHistoryPanel(options) {
         if (!id || typeof id !== 'string') return '未识别';
         return id.length <= 16 ? id : id.slice(0, 8) + '…' + id.slice(-6);
     }
+
     function formatDateTime(val) {
         if (val === undefined || val === null || val === '') return '--';
         try {
@@ -983,6 +1016,7 @@ function mountSeatHistoryPanel(options) {
         if (val === null) return 'null';
         return isDate ? formatDateTime(val) : String(val);
     }
+
     // Theme Management
     var darkMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
     function getExplicitTheme(node) {
@@ -1070,7 +1104,7 @@ function mountSeatHistoryPanel(options) {
 
         btn.setAttribute('aria-expanded', String(next));
         btn.setAttribute('data-open', String(next));
-        iconSlot.innerHTML = next ? ICONS.close : ICONS.contacts;
+        iconSlot.innerHTML = ICONS.contacts;
         btn.setAttribute('aria-label', next ? '关闭席位阈值历史' : '席位阈值历史');
         btn.setAttribute('title', next ? '关闭席位阈值历史' : '席位阈值历史');
 
@@ -1192,6 +1226,7 @@ function mountSeatHistoryPanel(options) {
         }
         btnHost.style.display = '';
         btn.hidden = false;
+
         if (isOpen) {
             var btnRect = btn.getBoundingClientRect();
             if (!isElementVisible(btnHost) || btnRect.width <= 0 || btnRect.height <= 0 ||
@@ -1241,6 +1276,7 @@ function mountSeatHistoryPanel(options) {
             updatePosition();
         });
     }
+
     window.addEventListener('resize', schedulePositionUpdate, { passive: true });
     window.addEventListener('scroll', schedulePositionUpdate, { capture: true, passive: true });
     window.addEventListener('popstate', schedulePositionUpdate, { passive: true });
@@ -1259,6 +1295,7 @@ function mountSeatHistoryPanel(options) {
     domObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
 
     var pollIntervalId = setInterval(schedulePositionUpdate, 1200);
+
     // Rendering
     function renderField(label, value, isNull, parent, title) {
         var field = el('div', 'cg-sh-field', null, parent);
@@ -1418,6 +1455,503 @@ function mountSeatHistoryPanel(options) {
         }
     };
 }
+
+
+function mountSeatPolicyToast(options) {
+    'use strict';
+    options = options || {};
+
+    var destroyed = false;
+    var isVisible = false;
+    var isHovered = false;
+    var isFocused = false;
+    var burstCount = 0;
+    var hideTimeoutId = null;
+    var hideFallbackTimer = null;
+    var seenKeys = [];
+    var HIDE_DELAY = 6000;
+
+    // Clean up any existing stale toast host instances
+    var oldHosts = document.querySelectorAll('[data-seat-toast]');
+    for (var h = 0; h < oldHosts.length; h++) {
+        oldHosts[h].remove();
+    }
+
+    var ICONS = {
+        close: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+    };
+
+    var THEME_CSS = `
+        :host {
+            --cg-st-bg: #ffffff;
+            --cg-st-bg-hover: rgba(0, 0, 0, 0.05);
+            --cg-st-border: rgba(0, 0, 0, 0.12);
+            --cg-st-text-primary: #0d0d0d;
+            --cg-st-text-secondary: #5d5d5d;
+            --cg-st-text-muted: #8e8e8e;
+            --cg-st-tag-bg: rgba(0, 0, 0, 0.05);
+            --cg-st-shadow: 0 10px 25px -5px rgba(0,0,0,0.1), 0 8px 10px -6px rgba(0,0,0,0.1), 0 0 0 1px rgba(0,0,0,0.06);
+            --cg-st-focus-ring: #0d0d0d;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 2147483646;
+            pointer-events: none;
+        }
+        :host([data-theme="dark"]) {
+            --cg-st-bg: #212121;
+            --cg-st-bg-hover: rgba(255, 255, 255, 0.08);
+            --cg-st-border: rgba(255, 255, 255, 0.15);
+            --cg-st-text-primary: #ececec;
+            --cg-st-text-secondary: #b4b4b4;
+            --cg-st-text-muted: #737373;
+            --cg-st-tag-bg: rgba(255, 255, 255, 0.06);
+            --cg-st-shadow: 0 10px 25px -5px rgba(0,0,0,0.5), 0 8px 10px -6px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.1);
+            --cg-st-focus-ring: #ececec;
+        }
+        .cg-st-card {
+            pointer-events: auto;
+            width: 320px;
+            max-width: calc(100vw - 32px);
+            box-sizing: border-box;
+            background: var(--main-surface-primary, var(--cg-st-bg));
+            border: 1px solid var(--border-light, var(--cg-st-border));
+            border-radius: 10px;
+            box-shadow: var(--cg-st-shadow);
+            color: var(--text-primary, var(--cg-st-text-primary));
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            opacity: 0;
+            transform: translateY(8px);
+            transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            user-select: none;
+        }
+        .cg-st-card.is-visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .cg-st-card[hidden] {
+            display: none !important;
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .cg-st-card {
+                transition: none !important;
+            }
+            .cg-st-close-btn {
+                transition: none !important;
+            }
+        }
+        .cg-st-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .cg-st-title-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
+        .cg-st-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-primary, var(--cg-st-text-primary));
+            line-height: 1.3;
+        }
+        .cg-st-burst-badge {
+            font-size: 10px;
+            font-weight: 500;
+            padding: 1px 5px;
+            border-radius: 4px;
+            background: var(--cg-st-tag-bg);
+            color: var(--text-secondary, var(--cg-st-text-secondary));
+            font-variant-numeric: tabular-nums;
+        }
+        .cg-st-close-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            min-width: 36px;
+            min-height: 36px;
+            border-radius: 6px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary, var(--cg-st-text-muted));
+            cursor: pointer;
+            padding: 0;
+            outline: none;
+            transition: background-color 0.15s ease, color 0.15s ease;
+            flex-shrink: 0;
+        }
+        .cg-st-close-btn:hover {
+            background-color: var(--main-surface-secondary, var(--cg-st-bg-hover));
+            color: var(--text-primary, var(--cg-st-text-primary));
+        }
+        .cg-st-close-btn:focus-visible {
+            outline: 2px solid var(--cg-st-focus-ring);
+            outline-offset: 1px;
+        }
+        @media (pointer: coarse) {
+            .cg-st-close-btn {
+                width: 44px;
+                height: 44px;
+                min-width: 44px;
+                min-height: 44px;
+            }
+        }
+        .cg-st-body {
+            font-size: 12px;
+            color: var(--text-secondary, var(--cg-st-text-secondary));
+            line-height: 1.4;
+            word-break: break-word;
+        }
+        .cg-st-meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 2px;
+        }
+        .cg-st-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 3px;
+            font-size: 11px;
+            font-variant-numeric: tabular-nums;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--cg-st-tag-bg);
+            color: var(--text-secondary, var(--cg-st-text-secondary));
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .cg-st-pill-k {
+            font-weight: 400;
+            opacity: 0.85;
+        }
+        .cg-st-pill-v {
+            font-weight: 600;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+    `;
+
+    function el(tag, cls, text, parent, attrs) {
+        var node = document.createElement(tag);
+        if (cls) node.className = cls;
+        if (text !== undefined && text !== null) node.textContent = text;
+        if (attrs) {
+            for (var k in attrs) {
+                if (k === 'hidden') node.hidden = Boolean(attrs[k]);
+                else if (k === 'disabled') node.disabled = Boolean(attrs[k]);
+                else node.setAttribute(k, attrs[k]);
+            }
+        }
+        if (parent) parent.appendChild(node);
+        return node;
+    }
+
+    var toastHost = document.createElement('div');
+    toastHost.id = '__chatgpt_team_seat_toast_host__';
+    toastHost.setAttribute('data-seat-toast', '');
+    (document.body || document.documentElement).appendChild(toastHost);
+
+    var shadow = toastHost.attachShadow({ mode: 'open' });
+    var styleNode = document.createElement('style');
+    styleNode.textContent = THEME_CSS;
+    shadow.appendChild(styleNode);
+
+    var card = el('div', 'cg-st-card', null, shadow, {
+        role: 'status',
+        'aria-live': 'polite',
+        hidden: true
+    });
+
+    var header = el('div', 'cg-st-header', null, card);
+    var titleGroup = el('div', 'cg-st-title-group', null, header);
+    var titleEl = el('span', 'cg-st-title', '检测到席位策略变化', titleGroup);
+    var burstBadge = el('span', 'cg-st-burst-badge', null, titleGroup, { hidden: true });
+
+    var closeBtn = el('button', 'cg-st-close-btn', null, header, {
+        type: 'button',
+        'aria-label': '关闭提示',
+        title: '关闭提示'
+    });
+    closeBtn.innerHTML = ICONS.close;
+
+    var bodyText = el('div', 'cg-st-body', '已记录当前工作空间的新席位策略。', card);
+    var metaRow = el('div', 'cg-st-meta-row', null, card);
+
+    // Theme Management
+    var darkMedia = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    function getExplicitTheme(node) {
+        if (!node) return null;
+        var dt = node.getAttribute('data-theme');
+        if (dt === 'dark' || dt === 'light') return dt;
+        if (node.classList.contains('dark')) return 'dark';
+        if (node.classList.contains('light')) return 'light';
+        return null;
+    }
+
+    function updateTheme() {
+        if (destroyed) return;
+        var theme = getExplicitTheme(document.documentElement) ||
+                    getExplicitTheme(document.body) ||
+                    (darkMedia && darkMedia.matches ? 'dark' : 'light');
+        toastHost.setAttribute('data-theme', theme);
+    }
+    updateTheme();
+    if (darkMedia) darkMedia.addEventListener('change', updateTheme);
+
+    var themeObserver = new MutationObserver(updateTheme);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme'] });
+    if (document.body) {
+        themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme'] });
+    }
+
+    // Auto-hide timing & Pause logic
+    function isCardHovered() {
+        try {
+            return card.matches(':hover');
+        } catch (_) {
+            return isHovered;
+        }
+    }
+
+    function isCardFocused() {
+        try {
+            return card.contains(shadow.activeElement);
+        } catch (_) {
+            return isFocused;
+        }
+    }
+
+    function shouldPause() {
+        return isCardHovered() || isCardFocused();
+    }
+
+    function finishHide() {
+        if (hideFallbackTimer) {
+            clearTimeout(hideFallbackTimer);
+            hideFallbackTimer = null;
+        }
+        if (!isVisible) {
+            card.hidden = true;
+            while (metaRow.firstChild) {
+                metaRow.removeChild(metaRow.firstChild);
+            }
+        }
+    }
+
+    function hideToast() {
+        if (destroyed || !isVisible) return;
+        isVisible = false;
+        burstCount = 0;
+        clearTimeout(hideTimeoutId);
+        hideTimeoutId = null;
+        card.classList.remove('is-visible');
+
+        var isReducedMotion = Boolean(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        if (isReducedMotion) {
+            finishHide();
+        } else {
+            if (hideFallbackTimer) clearTimeout(hideFallbackTimer);
+            hideFallbackTimer = setTimeout(finishHide, 220);
+        }
+    }
+
+    function startAutoHide() {
+        if (destroyed || !isVisible || shouldPause()) return;
+        clearTimeout(hideTimeoutId);
+        hideTimeoutId = setTimeout(function () {
+            if (!destroyed && !shouldPause()) {
+                hideToast();
+            }
+        }, HIDE_DELAY);
+    }
+
+    function pauseAutoHide() {
+        clearTimeout(hideTimeoutId);
+        hideTimeoutId = null;
+    }
+
+    card.addEventListener('pointerenter', function () {
+        isHovered = true;
+        pauseAutoHide();
+    });
+    card.addEventListener('pointerleave', function () {
+        isHovered = false;
+        if (!shouldPause() && isVisible) {
+            startAutoHide();
+        }
+    });
+    card.addEventListener('focusin', function () {
+        isFocused = true;
+        pauseAutoHide();
+    });
+    card.addEventListener('focusout', function () {
+        Promise.resolve().then(function () {
+            if (destroyed) return;
+            isFocused = isCardFocused();
+            if (!shouldPause() && isVisible) {
+                startAutoHide();
+            }
+        });
+    });
+
+    card.addEventListener('transitionend', function (e) {
+        if (e.target === card && !isVisible) {
+            finishHide();
+        }
+    });
+
+    closeBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        isHovered = false;
+        isFocused = false;
+        try { closeBtn.blur(); } catch (_) {}
+        hideToast();
+    });
+
+    function makeKey(ev) {
+        if (!ev || typeof ev !== 'object') return '';
+        var pol = ev.policy || {};
+        return [
+            ev.accountId || '',
+            ev.userId || '',
+            ev.capturedAt || '',
+            pol.vacancyOrdinal != null ? pol.vacancyOrdinal : '',
+            pol.freeVacancyThreshold != null ? pol.freeVacancyThreshold : '',
+            pol.billingStartsAt || '',
+            pol.expiresAt || ''
+        ].join('|');
+    }
+
+    function show(event) {
+        if (destroyed || !event || typeof event !== 'object') return;
+        if (event.saved !== true || typeof event.accountId !== 'string' || !event.accountId) return;
+
+        // Verify event matches current account if options.getAccountId / options.currentAccountId is available
+        var getAccFn = typeof options.getAccountId === 'function' ? options.getAccountId :
+                       typeof options.currentAccountId === 'function' ? options.currentAccountId : null;
+        if (getAccFn) {
+            try {
+                var currentAcc = getAccFn();
+                if (typeof currentAcc !== 'string' || !currentAcc || currentAcc !== event.accountId) {
+                    return;
+                }
+            } catch (_) {
+                return;
+            }
+        }
+
+        // Deduplication: defensively deduplicate identical 4-tuples within small bounded memory
+        var key = makeKey(event);
+        if (key && seenKeys.indexOf(key) >= 0) {
+            return;
+        }
+        if (key) {
+            seenKeys.push(key);
+            if (seenKeys.length > 50) {
+                seenKeys.shift();
+            }
+        }
+
+        if (hideFallbackTimer) {
+            clearTimeout(hideFallbackTimer);
+            hideFallbackTimer = null;
+        }
+
+        var policy = event.policy || {};
+
+        // Update body content and metadata pills
+        bodyText.textContent = '已记录当前工作空间的新席位策略。';
+
+        while (metaRow.firstChild) {
+            metaRow.removeChild(metaRow.firstChild);
+        }
+
+        if (policy.vacancyOrdinal !== undefined && policy.vacancyOrdinal !== null) {
+            var pill1 = el('span', 'cg-st-pill', null, metaRow);
+            el('span', 'cg-st-pill-k', 'vacancy_ordinal:', pill1);
+            el('span', 'cg-st-pill-v', String(policy.vacancyOrdinal), pill1);
+        }
+        if (policy.freeVacancyThreshold !== undefined && policy.freeVacancyThreshold !== null) {
+            var pill2 = el('span', 'cg-st-pill', null, metaRow);
+            el('span', 'cg-st-pill-k', 'free_vacancy_threshold:', pill2);
+            el('span', 'cg-st-pill-v', String(policy.freeVacancyThreshold), pill2);
+        }
+
+        // Burst handling: if already showing, increment badge
+        if (isVisible) {
+            burstCount++;
+            burstBadge.textContent = '+' + burstCount;
+            burstBadge.hidden = false;
+        } else {
+            burstCount = 0;
+            burstBadge.textContent = '';
+            burstBadge.hidden = true;
+            card.hidden = false;
+            // Force reflow for enter transition
+            void card.offsetWidth;
+            card.classList.add('is-visible');
+            isVisible = true;
+        }
+
+        if (!shouldPause()) {
+            startAutoHide();
+        }
+    }
+
+    function clear() {
+        if (destroyed) return;
+        isVisible = false;
+        burstCount = 0;
+        isHovered = false;
+        isFocused = false;
+        clearTimeout(hideTimeoutId);
+        hideTimeoutId = null;
+        if (hideFallbackTimer) {
+            clearTimeout(hideFallbackTimer);
+            hideFallbackTimer = null;
+        }
+        card.classList.remove('is-visible');
+        card.hidden = true;
+        bodyText.textContent = '';
+        while (metaRow.firstChild) {
+            metaRow.removeChild(metaRow.firstChild);
+        }
+    }
+
+    function destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        clearTimeout(hideTimeoutId);
+        hideTimeoutId = null;
+        if (hideFallbackTimer) {
+            clearTimeout(hideFallbackTimer);
+            hideFallbackTimer = null;
+        }
+        if (themeObserver) themeObserver.disconnect();
+        if (darkMedia) darkMedia.removeEventListener('change', updateTheme);
+        toastHost.remove();
+    }
+
+    return {
+        show: show,
+        clear: clear,
+        destroy: destroy
+    };
+}
+
 
 function startNoticeHiding() {
     const TARGET_HEADING = "工作区有成员达到使用上限";
@@ -1645,14 +2179,16 @@ function createTeamUsageController(onChange) {
   var syncingAccount = false;
   var accountWatch = null;
 
-  /* User-supplied reference rates in USD per 1M tokens, not verified billing data. */
+  /* User-supplied reference rates in USD per 1M tokens, except Astra's confirmed standard rates (2026-09-08). */
   var REFERENCE_RATES = {
     'gpt-5.6-sol': [5, 0.5, 30, 2.5],
     'gpt-5.6-terra': [2, 0.2, 12, 2.5],
     'gpt-5.6-luna': [0.2, 0.02, 1.2, 2.5],
     'gpt-5.5': [5, 0.5, 30, 2.5],
     'gpt-5.4': [2.5, 0.25, 15, 2],
-    'gpt-5.4-mini': [0.75, 0.075, 4.5, 2]
+    'gpt-5.4-mini': [0.75, 0.075, 4.5, 2],
+    // Official: https://developers.openai.com/api/docs/models/gpt-6-astra (2026-09-08).
+    'gpt-6-astra': [10, 1, 50, 2]
   };
   var TOKEN_KEYS = [
     'text_total_tokens', 'total_text_tokens', 'uncached_text_input_tokens',
@@ -2194,6 +2730,10 @@ function createTeamUsageController(onChange) {
     return typeof value === 'string' && /^[a-z0-9._-]{1,32}$/i.test(value) ? value.toLowerCase() : 'standard';
   }
 
+  function pricingSpeed(name, speed) {
+    return name.toLowerCase() === 'gpt-6-astra' && speed === 'priority' ? 'fast' : speed;
+  }
+
   function hasTokenFields(raw) {
     return hasAny(raw, TOKEN_KEYS);
   }
@@ -2263,6 +2803,7 @@ function createTeamUsageController(onChange) {
 
   function priceFor(name, speed) {
     var key = name.toLowerCase();
+    speed = key === 'gpt-6-astra' && speed === 'priority' ? 'fast' : speed;
     if (key === 'codex-auto-review') key = 'gpt-5.6-luna';
     if (key === 'gpt-image-2' || key === 'image2') return { image: true, family: key, fallback: false, multiplier: 1 };
     if (Object.prototype.hasOwnProperty.call(REFERENCE_RATES, key)) {
@@ -2294,6 +2835,10 @@ function createTeamUsageController(onChange) {
         metrics.imageOutput + '×$30/M；按参考费率估算，非实际账单';
     }
     var rate = REFERENCE_RATES[pricing.family];
+    if (pricing.family === 'gpt-6-astra') {
+      return '文本：输入=' + metrics.textUncached + '×$10/M，缓存=' + metrics.textCached + '×$1/M，输出=' +
+        metrics.textOutput + '×$50/M；GPT-6 Astra 官网标准短上下文费率，快速×2（如适用）；超过 272000 输入的长上下文及 $12.50/M 缓存写入未分列，实际费用可能不同。';
+    }
     return '文本：输入=' + metrics.textUncached + '×$' + rate[0] + '/M，缓存=' + metrics.textCached + '×$' +
       rate[1] + '/M，输出=' + metrics.textOutput + '×$' + rate[2] + '/M；' + pricing.family +
       (pricing.multiplier !== 1 ? '，快速×' + pricing.multiplier : '') +
@@ -2302,9 +2847,12 @@ function createTeamUsageController(onChange) {
 
   function tokenModel(raw, notices) {
     var name = safeModelName(raw);
-    var speed = safeSpeed(raw);
+    var speed = pricingSpeed(name, safeSpeed(raw));
     var pricing = priceFor(name, speed);
     var metrics = rawMetrics(raw, pricing.image);
+    if (pricing.family === 'gpt-6-astra') {
+      addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
+    }
     if (name.toLowerCase() === 'codex-auto-review') addNotice(notices, 'codex-auto-review 按用户指定映射为 gpt-5.6-luna。');
     if (pricing.fallback) addNotice(notices, '未知文本模型按 gpt-5.5 参考费率显示，非实际账单。');
     var estimated = moneyFor(metrics, pricing);
@@ -2324,7 +2872,8 @@ function createTeamUsageController(onChange) {
     var credits = numberFrom(raw, ['credits', 'credit_count']);
     var users = numberFrom(raw, ['users', 'active_users', 'active_members']);
     if (turns === null && threads === null && credits === null && users === null) return null;
-    return { name: safeModelName(raw), speed: safeSpeed(raw), turns: turns, threads: threads, credits: credits, users: users };
+    var name = safeModelName(raw);
+    return { name: name, speed: pricingSpeed(name, safeSpeed(raw)), turns: turns, threads: threads, credits: credits, users: users };
   }
 
   function activityIsAllZero(activity) {
@@ -2368,6 +2917,9 @@ function createTeamUsageController(onChange) {
     var tokens = [];
     var activities = [];
     rawModelValues(row).forEach(function (raw) {
+      if (safeModelName(raw).toLowerCase() === 'gpt-6-astra') {
+        addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
+      }
       if (hasTokenFields(raw)) tokens.push(tokenModel(raw, notices));
       var activity = activityRow(raw);
       if (activity) activities.push(activity);
@@ -2499,6 +3051,9 @@ function createTeamUsageController(onChange) {
       textCached: cached, textOutput: output, imageUncached: null, imageCached: null, imageOutput: null
     };
     var estimate = moneyFor(metrics, pricing);
+    if (pricing.family === 'gpt-6-astra') {
+      addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
+    }
     if (pricing.fallback) addNotice(notices, '未知文本模型按 gpt-5.5 参考费率显示，非实际账单。');
     if (name.toLowerCase() === 'codex-auto-review') addNotice(notices, 'codex-auto-review 按用户指定映射为 gpt-5.6-luna。');
     return {
@@ -2506,7 +3061,9 @@ function createTeamUsageController(onChange) {
       uncachedInputTokens: uncached, cachedInputTokens: cached, outputTokens: output,
       estimatedUsd: estimate, estimatedAllocation: true, fallbackPricing: pricing.fallback,
       incompleteImage: false,
-      calculation: '按积分与参考混合费率分配总令牌；按参考费率估算，非实际账单'
+      calculation: pricing.family === 'gpt-6-astra'
+        ? '按积分与参考混合费率分配总令牌；' + calculationFor(metrics, pricing, estimate)
+        : '按积分与参考混合费率分配总令牌；按参考费率估算，非实际账单'
     };
   }
 
@@ -2953,20 +3510,49 @@ function createTeamUsageController(onChange) {
   };
 }
 
-function mountTeamUsagePanel(options) {
-  'use strict';
-  options = options || {};
+
+/**
+ * Codex Quota Compass - Original UI Restoration
+ * Faithful verbatim restoration of original CodexQuotaCompass visual shell, CSS,
+ * layout, icons, sections, tables, graphs, and copy style.
+ *
+ * Integrated via controller API: mountTeamUsagePanel(options) -> { update(snapshot), destroy() }
+ */
+
+function mountTeamUsagePanel(options = {}) {
+  const CONFIG = {
+    DAY_MS: 24 * 60 * 60 * 1000,
+    MAX_RANGE_DAYS: 366,
+    TARGET_WINDOW_SECONDS: 7 * 24 * 60 * 60,
+    TOKEN_CACHE_FALLBACK_MS: 9 * 60 * 1000,
+    USE_UTC_DAY: true,
+    EPS: 1e-9,
+  };
+
+  const SVG_BANKNOTE = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/></svg>';
+  const GPT_IMAGE_2_PRICING_URL = 'https://platform.openai.com/docs/pricing';
 
   let destroyed = false;
-  const activeTimers = new Set();
-  const activeRafs = new Set();
+  let isModalOpen = false;
+  let modalGeneration = 0;
+  let lastFocusedTrigger = null;
+  let currentActiveAccount = null;
+  let initialAccountObserved = false;
 
-  function safeSetTimeout(fn, delay) {
+  let dateInputDirty = false;
+  let localStartDate = '';
+  let localEndDate = '';
+
+  const activeTimers = new Set();
+  const activeAnimFrames = new Set();
+  const activeObjectUrls = new Set();
+
+  function safeSetTimeout(fn, ms) {
     if (destroyed) return null;
     const id = setTimeout(() => {
       activeTimers.delete(id);
       if (!destroyed) fn();
-    }, delay);
+    }, ms);
     activeTimers.add(id);
     return id;
   }
@@ -2974,480 +3560,32 @@ function mountTeamUsagePanel(options) {
   function safeRequestAnimationFrame(fn) {
     if (destroyed) return null;
     const id = requestAnimationFrame(() => {
-      activeRafs.delete(id);
+      activeAnimFrames.delete(id);
       if (!destroyed) fn();
     });
-    activeRafs.add(id);
+    activeAnimFrames.add(id);
     return id;
   }
 
   function clearAllAsync() {
     activeTimers.forEach((id) => clearTimeout(id));
     activeTimers.clear();
-    activeRafs.forEach((id) => cancelAnimationFrame(id));
-    activeRafs.clear();
-  }
-
-  const activeObjectUrls = new Set();
-  let modalGeneration = 0;
-
-  let genericErrorMessage = null;
-  function safeInvoke(fn, ...args) {
-    if (destroyed || typeof fn !== 'function') return Promise.resolve(null);
-    return Promise.resolve()
-      .then(() => {
-        if (destroyed) return null;
-        return fn(...args);
-      })
-      .catch(() => {
-        if (destroyed) return null;
-        genericErrorMessage = '操作失败，请稍后重试';
-        if (isModalOpen) renderModalContent();
-        return null;
-      });
-  }
-
-  function invokeLoad(params) {
-    if (destroyed || !isModalOpen) return Promise.resolve(null);
-    const gen = modalGeneration;
-    genericErrorMessage = null;
-    return Promise.resolve()
-      .then(() => {
-        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
-        if (typeof options.onLoad !== 'function') return null;
-        return options.onLoad(params);
-      })
-      .catch(() => {
-        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
-        genericErrorMessage = '操作失败，请稍后重试';
-        renderModalContent();
-        return null;
-      });
-  }
-
-  function invokeSetView(mode) {
-    if (destroyed || !isModalOpen) return Promise.resolve(null);
-    const gen = modalGeneration;
-    genericErrorMessage = null;
-    return Promise.resolve()
-      .then(() => {
-        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
-        if (typeof options.onSetView !== 'function') return null;
-        return options.onSetView(mode);
-      })
-      .catch(() => {
-        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
-        genericErrorMessage = '操作失败，请稍后重试';
-        renderModalContent();
-        return null;
-      });
-  }
-
-  // Default snapshot state
-  let snapshot = (typeof options.getSnapshot === 'function' && options.getSnapshot()) || {
-    status: 'idle',
-    error: null,
-    accountId: null,
-    accountMode: null,
-    viewMode: 'personal',
-    range: { startDate: '', endDate: '' },
-    quota: null,
-    summary: {},
-    models: [],
-    daily: [],
-    clients: [],
-    modelActivity: [],
-    notices: [],
-    updatedAt: null
-  };
-
-  let currentActiveAccount = (snapshot && snapshot.accountId !== undefined) ? snapshot.accountId : null;
-  let initialAccountObserved = (snapshot && snapshot.accountId !== null && snapshot.accountId !== undefined);
-  let isModalOpen = false;
-  let lastFocusedTrigger = null;
-  const expandedDates = new Set();
-  let lastRenderedSignature = null;
-  let lastRenderedAccount = null;
-  let lastRenderedRange = null;
-
-  let localStartDate = '';
-  let localEndDate = '';
-  let dateInputDirty = false;
-
-  // SVG Icons (Lucide style, currentColor, stroke-width=2)
-  const SVG_BANKNOTE = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/></svg>';
-  const SVG_CLOSE = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>';
-  const SVG_REFRESH = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5"/></svg>';
-  const SVG_CHEVRON_RIGHT = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>';
-  const SVG_CHEVRON_DOWN = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>';
-  const SVG_DOWNLOAD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>';
-
-  // Formatters
-  function pad2(n) { return n < 10 ? '0' + n : String(n); }
-
-  function formatNum(val, fallback) {
-    fallback = fallback !== undefined ? fallback : '—';
-    if (val === null || val === undefined || val === '') return fallback;
-    const n = Number(val);
-    if (!Number.isFinite(n)) return fallback;
-    return n.toLocaleString('en-US');
-  }
-
-  function formatUsd(val, fallback) {
-    fallback = fallback !== undefined ? fallback : '—';
-    if (val === null || val === undefined || val === '') return fallback;
-    const n = Number(val);
-    if (!Number.isFinite(n)) return fallback;
-    return '$' + (n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toFixed(4));
-  }
-
-  function formatDateTime(val) {
-    if (!val) return '—';
-    try {
-      const d = new Date(val);
-      if (isNaN(d.getTime())) return String(val);
-      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-    } catch (_) {
-      return String(val);
-    }
-  }
-
-  function formatDate(val) {
-    if (!val) return '—';
-    if (typeof val === 'string') {
-      const m = val.trim().match(/^(\d{4}-\d{2}-\d{2})/);
-      if (m) return m[1];
-    }
-    try {
-      const d = new Date(val);
-      if (isNaN(d.getTime())) return String(val);
-      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
-    } catch (_) {
-      return String(val);
-    }
-  }
-
-  function getUtcDateStr(daysAgo) {
-    daysAgo = daysAgo || 0;
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() - daysAgo);
-    return d.toISOString().slice(0, 10);
-  }
-
-  // Safe DOM builder
-  function el(tag, cls, text, parent, attrs) {
-    const node = document.createElement(tag);
-    if (cls) node.className = cls;
-    if (text !== undefined && text !== null && text !== '') node.textContent = String(text);
-    if (attrs) {
-      for (const k in attrs) {
-        if (attrs[k] !== undefined && attrs[k] !== null) node.setAttribute(k, String(attrs[k]));
-      }
-    }
-    if (parent) parent.appendChild(node);
-    return node;
+    activeAnimFrames.forEach((id) => cancelAnimationFrame(id));
+    activeAnimFrames.clear();
   }
 
   // Clean stale modal hosts
-  const oldHost = document.getElementById('cg-team-usage-host');
+  const oldHost = document.getElementById('codex-compass-ultimate-host');
   if (oldHost && oldHost.parentNode) {
-    oldHost.parentNode.removeChild(oldHost);
+    try { oldHost.parentNode.removeChild(oldHost); } catch (_) {}
   }
 
-  // Shadow DOM host for modal dialog
   const host = document.createElement('div');
-  host.id = 'cg-team-usage-host';
-  host.style.position = 'absolute';
-  host.style.top = '0';
-  host.style.left = '0';
-  host.style.zIndex = '99999';
+  host.id = 'codex-compass-ultimate-host';
+  host.style.display = 'none'; // Default closed host in body
   document.body.appendChild(host);
+
   const shadow = host.attachShadow({ mode: 'open' });
-
-  // Native ChatGPT neutral theme tokens and styles
-  const styleEl = document.createElement('style');
-  styleEl.textContent = `
-    *, *::before, *::after { box-sizing: border-box; }
-    :host {
-      color-scheme: light;
-      --main-surface-primary: #ffffff;
-      --main-surface-secondary: #f7f7f8;
-      --main-surface-tertiary: #ececf1;
-      --text-primary: #0d0d0d;
-      --text-secondary: #5d5d5d;
-      --text-tertiary: #8e8e8e;
-      --border-light: rgba(0, 0, 0, 0.1);
-      --border-medium: rgba(0, 0, 0, 0.2);
-      --hover-bg: rgba(0, 0, 0, 0.05);
-      --badge-bg: rgba(0, 0, 0, 0.06);
-      --accent-pill: #0d0d0d;
-      --accent-pill-text: #ffffff;
-      --error-bg: #fef2f2;
-      --error-text: #b91c1c;
-      --error-border: #fca5a5;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      font-size: 13px;
-      line-height: 1.5;
-      color: var(--text-primary);
-      -webkit-font-smoothing: antialiased;
-    }
-    :host(.dark) {
-      color-scheme: dark;
-      --main-surface-primary: #212121;
-      --main-surface-secondary: #2f2f2f;
-      --main-surface-tertiary: #424242;
-      --text-primary: #ececec;
-      --text-secondary: #b4b4b4;
-      --text-tertiary: #8e8e8e;
-      --border-light: rgba(255, 255, 255, 0.12);
-      --border-medium: rgba(255, 255, 255, 0.25);
-      --hover-bg: rgba(255, 255, 255, 0.08);
-      --badge-bg: rgba(255, 255, 255, 0.1);
-      --accent-pill: #ececec;
-      --accent-pill-text: #171717;
-      --error-bg: #451a1a;
-      --error-text: #fca5a5;
-      --error-border: #7f1d1d;
-    }
-    button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
-      outline: 2px solid var(--border-medium);
-      outline-offset: 1px;
-    }
-    dialog.modal-backdrop {
-      color-scheme: inherit;
-      position: fixed; inset: 0;
-      width: 100vw; height: 100vh;
-      max-width: 100vw; max-height: 100vh;
-      margin: 0; padding: 16px;
-      border: none;
-      background: rgba(0, 0, 0, 0.52);
-      backdrop-filter: blur(2px);
-      display: none; align-items: center; justify-content: center;
-      box-sizing: border-box;
-      color: inherit;
-    }
-    dialog.modal-backdrop[open] {
-      display: flex;
-      animation: fadeIn 0.15s ease-out;
-    }
-    dialog.modal-backdrop::backdrop {
-      background: transparent;
-    }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    @keyframes slideUp { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
-    .modal-dialog {
-      position: relative; width: 100%; max-width: 1100px;
-      max-height: calc(100dvh - 36px);
-      display: flex; flex-direction: column;
-      background: var(--main-surface-primary);
-      color: var(--text-primary);
-      border: 1px solid var(--border-light);
-      border-radius: 12px;
-      box-shadow: 0 20px 25px -5px rgba(0,0,0,0.28), 0 8px 10px -6px rgba(0,0,0,0.28);
-      animation: slideUp 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-      overflow: hidden;
-    }
-    .modal-header {
-      padding: 16px 20px 12px;
-      border-bottom: 1px solid var(--border-light);
-      background: var(--main-surface-primary);
-      flex-shrink: 0;
-    }
-    .title-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
-    .title-wrap { display: flex; align-items: center; gap: 8px; }
-    .title-wrap h2 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.3; }
-    .subtitle-note { font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
-    .btn-close {
-      display: inline-flex; align-items: center; justify-content: center;
-      width: 36px; height: 36px; min-width: 36px; min-height: 36px;
-      border-radius: 6px; border: none; background: transparent;
-      color: var(--text-secondary); cursor: pointer;
-      transition: background-color 0.12s, color 0.12s;
-    }
-    .btn-close:hover { background: var(--hover-bg); color: var(--text-primary); }
-    .controls-row {
-      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-      gap: 12px; margin-top: 12px; padding-top: 12px;
-      border-top: 1px dashed var(--border-light);
-    }
-    .controls-left, .controls-right { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    .segmented-group {
-      display: inline-flex; align-items: center; padding: 2px;
-      background: var(--main-surface-secondary);
-      border: 1px solid var(--border-light);
-      border-radius: 8px;
-    }
-    .segmented-btn {
-      padding: 6px 14px; font-size: 12px; font-weight: 500;
-      border-radius: 6px; border: none; background: transparent;
-      color: var(--text-secondary); cursor: pointer;
-      transition: background-color 0.12s, color 0.12s;
-      min-height: 36px;
-    }
-    .segmented-btn.active {
-      background: var(--main-surface-primary);
-      color: var(--text-primary);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
-      font-weight: 600;
-    }
-    .segmented-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .btn-preset {
-      padding: 6px 12px; font-size: 12px; border-radius: 6px;
-      border: 1px solid var(--border-light);
-      background: var(--main-surface-secondary);
-      color: var(--text-primary); cursor: pointer;
-      transition: background-color 0.12s; min-height: 36px;
-    }
-    .btn-preset:hover:not(:disabled) { background: var(--hover-bg); }
-    .btn-preset:disabled { opacity: 0.5; cursor: not-allowed; }
-    .date-group { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
-    .date-input {
-      height: 36px; min-height: 36px; padding: 4px 10px; font-size: 12px; font-family: inherit;
-      background: var(--main-surface-secondary); color: var(--text-primary);
-      border: 1px solid var(--border-light); border-radius: 6px; outline: none;
-    }
-    .date-input:focus { border-color: var(--border-medium); }
-    .btn-apply {
-      padding: 6px 14px; height: 36px; min-height: 36px; font-size: 12px; font-weight: 500;
-      background: var(--accent-pill); color: var(--accent-pill-text);
-      border: none; border-radius: 6px; cursor: pointer; transition: opacity 0.12s;
-    }
-    .btn-apply:hover:not(:disabled) { opacity: 0.9; }
-    .btn-apply:disabled { opacity: 0.5; cursor: not-allowed; }
-    .loading-bar-wrap {
-      height: 3px; width: 100%; background: var(--main-surface-secondary);
-      overflow: hidden; position: relative; margin-bottom: 12px; border-radius: 2px;
-    }
-    .loading-bar-inner {
-      position: absolute; height: 100%; background: var(--text-secondary);
-      width: 35%; animation: loadingAnim 1.2s infinite ease-in-out;
-    }
-    @keyframes loadingAnim { 0% { left: -35%; } 100% { left: 100%; } }
-    .modal-body {
-      padding: 16px 20px; overflow-y: auto; flex: 1 1 auto; scrollbar-width: thin;
-      min-height: 0;
-    }
-    .error-banner {
-      padding: 10px 14px; margin-bottom: 14px;
-      background: var(--error-bg); color: var(--error-text);
-      border: 1px solid var(--error-border); border-radius: 8px;
-      font-size: 13px; display: flex; align-items: center; justify-content: space-between;
-    }
-    .section-title {
-      font-size: 13px; font-weight: 600; color: var(--text-secondary);
-      margin: 16px 0 8px; display: flex; align-items: center; gap: 6px;
-    }
-    .kpi-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 10px; margin-bottom: 16px;
-    }
-    .kpi-card {
-      background: var(--main-surface-secondary);
-      border: 1px solid var(--border-light);
-      border-radius: 8px; padding: 10px 12px;
-      display: flex; flex-direction: column; justify-content: space-between;
-    }
-    .kpi-label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
-    .kpi-value {
-      font-size: 18px; font-weight: 600; color: var(--text-primary);
-      font-variant-numeric: tabular-nums; line-height: 1.2;
-    }
-    .kpi-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 4px; line-height: 1.3; }
-    .quota-bar {
-      height: 6px; width: 100%; background: var(--main-surface-tertiary);
-      border-radius: 3px; overflow: hidden; margin: 6px 0;
-    }
-    .quota-fill {
-      height: 100%; background: var(--text-primary); border-radius: 3px;
-      transition: width 0.25s ease;
-    }
-    .table-wrap {
-      border: 1px solid var(--border-light); border-radius: 8px;
-      overflow-x: auto; margin-bottom: 16px; background: var(--main-surface-primary);
-    }
-    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
-    .data-table th {
-      background: var(--main-surface-secondary); color: var(--text-secondary);
-      font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border-light);
-      white-space: nowrap;
-    }
-    .data-table td {
-      padding: 8px 10px; border-bottom: 1px solid var(--border-light);
-      color: var(--text-primary); font-variant-numeric: tabular-nums;
-    }
-    .data-table tr:last-child td { border-bottom: none; }
-    .data-table tr:hover td { background: var(--hover-bg); }
-    .badge {
-      display: inline-flex; align-items: center; padding: 2px 6px;
-      font-size: 10px; font-weight: 500; border-radius: 4px;
-      background: var(--badge-bg); color: var(--text-secondary); margin-left: 4px;
-    }
-    .daily-row-btn {
-      display: flex; align-items: center; justify-content: space-between;
-      width: 100%; min-height: 36px; padding: 8px 10px; background: transparent;
-      border: none; border-bottom: 1px solid var(--border-light);
-      color: var(--text-primary); font-size: 12px; cursor: pointer;
-      text-align: left; font-family: inherit; transition: background-color 0.12s;
-    }
-    .daily-row-btn:hover { background: var(--hover-bg); }
-    .daily-row-left { display: flex; align-items: center; gap: 8px; font-weight: 500; }
-    .daily-row-right { display: flex; align-items: center; gap: 16px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-    .daily-subpanel {
-      padding: 8px 12px 12px 32px; background: var(--main-surface-secondary);
-      border-bottom: 1px solid var(--border-light);
-    }
-    .notices-box {
-      padding: 10px 12px; background: var(--main-surface-secondary);
-      border: 1px dashed var(--border-light); border-radius: 8px;
-      margin-top: 12px; font-size: 11px; color: var(--text-secondary); line-height: 1.5;
-    }
-    .notices-box ul { margin: 4px 0 0 16px; padding: 0; }
-    .modal-footer {
-      padding: 12px 20px; border-top: 1px solid var(--border-light);
-      display: flex; align-items: center; justify-content: space-between;
-      flex-shrink: 0; background: var(--main-surface-primary);
-      font-size: 12px; color: var(--text-tertiary);
-    }
-    .footer-actions { display: flex; align-items: center; gap: 8px; }
-    .btn-action {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 6px 14px; min-height: 36px; font-size: 12px; font-weight: 500;
-      border-radius: 6px; border: 1px solid var(--border-light);
-      background: var(--main-surface-secondary); color: var(--text-primary);
-      cursor: pointer; transition: background-color 0.12s; font-family: inherit;
-    }
-    .btn-action:hover:not(:disabled) { background: var(--hover-bg); }
-    .btn-action:disabled { opacity: 0.5; cursor: not-allowed; }
-    @media (pointer: coarse) {
-      .btn-close { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
-      .segmented-btn, .btn-preset, .btn-apply, .btn-action, .date-input, .daily-row-btn {
-        min-height: 44px;
-      }
-    }
-    @media (max-width: 640px) {
-      .controls-row { flex-direction: column; align-items: stretch; gap: 10px; }
-      .controls-left, .controls-right { width: 100%; justify-content: space-between; }
-      .date-group { width: 100%; flex-direction: column; align-items: stretch; }
-      .date-input { width: 100%; }
-      .modal-dialog { max-height: 100dvh; border-radius: 0; }
-      .modal-backdrop { padding: 0; }
-      .modal-footer { flex-direction: column; align-items: stretch; gap: 10px; }
-      .footer-actions { width: 100%; flex-wrap: wrap; justify-content: flex-end; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.001ms !important;
-        animation-iteration-count: 1 !important;
-        transition-duration: 0.001ms !important;
-      }
-    }
-  `;
-  shadow.appendChild(styleEl);
-
-  // Cached matchMedia for dark color scheme
-  const darkMedia = (typeof window !== 'undefined' && window.matchMedia)
-    ? window.matchMedia('(prefers-color-scheme: dark)')
-    : null;
 
   function explicitTheme(node) {
     if (!node) return null;
@@ -3463,6 +3601,10 @@ function mountTeamUsagePanel(options) {
     return null;
   }
 
+  const darkMedia = (typeof window !== 'undefined' && typeof window.matchMedia === 'function')
+    ? window.matchMedia('(prefers-color-scheme: dark)')
+    : null;
+
   function resolveIsDark() {
     const htmlTheme = explicitTheme(document.documentElement);
     if (htmlTheme !== null) return htmlTheme;
@@ -3471,23 +3613,12 @@ function mountTeamUsagePanel(options) {
     return Boolean(darkMedia && darkMedia.matches);
   }
 
-  // Sync theme with native ChatGPT
   function syncTheme() {
     if (destroyed) return;
     const isDark = resolveIsDark();
     if (isDark) host.classList.add('dark');
     else host.classList.remove('dark');
   }
-
-  const themeObserver = new MutationObserver(() => syncTheme());
-  try {
-    if (document.documentElement) {
-      themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme'] });
-    }
-    if (document.body) {
-      themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme'] });
-    }
-  } catch (_) {}
 
   function handleMediaChange() {
     syncTheme();
@@ -3501,201 +3632,2728 @@ function mountTeamUsagePanel(options) {
     }
   }
 
+  const themeObserver = new MutationObserver(() => syncTheme());
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'data-theme'] });
+  if (document.body) {
+    themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class', 'data-theme'] });
+  }
   syncTheme();
 
-  // Native dialog container
-  const backdropEl = el('dialog', 'modal-backdrop', null, shadow, {
-    'aria-labelledby': 'cg-tu-title'
-  });
+  const showPanelHost = () => {
+    syncTheme();
+    host.style.display = 'block';
+  };
+  const hidePanel = () => {
+    host.style.display = 'none';
+  };
+  const createHostAndShadow = () => shadow;
+  const panelHost = () => host;
+  const toggleButton = () => null;
 
-  const dialogEl = el('div', 'modal-dialog', null, backdropEl, {
-    role: 'region',
-    'aria-labelledby': 'cg-tu-title'
-  });
+  // Verbatim 1440-line original CSS
+  const css = `
+    :host {
+      --bg-backdrop: rgba(15, 23, 42, 0.48);
+      --bg-modal: #ffffff;
+      --bg-header: #ffffff;
+      --bg-subtle: #f8fafc;
+      --bg-card: #ffffff;
+      --bg-card-hover: #f8fafc;
+      --bg-input: #ffffff;
+      --bg-table-header: #f8fafc;
+      --bg-table-row-hover: #f8fafc;
+      --bg-table-zebra: #fafbfc;
+      --bg-table-footer: #f8fafc;
+      --bg-details: #f8fafc;
+      --bg-details-card: #ffffff;
+      --bg-tag: #f1f5f9;
+      --bg-pre: #f8fafc;
 
-  // Modal Header
-  const headerEl = el('div', 'modal-header', null, dialogEl);
-  const titleRow = el('div', 'title-row', null, headerEl);
-  const titleWrap = el('div', 'title-wrap', null, titleRow);
+      --border: #e2e8f0;
+      --border-subtle: #f1f5f9;
+      --border-strong: #cbd5e1;
+      --border-focus: #10a37f;
 
-  const titleIconSpan = el('span', null, null, titleWrap);
-  titleIconSpan.innerHTML = SVG_BANKNOTE;
-  titleIconSpan.style.display = 'inline-flex';
-  titleIconSpan.style.color = 'var(--text-primary)';
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #94a3b8;
+      --text-inverse: #ffffff;
 
-  el('h2', null, 'Team额度统计', titleWrap, { id: 'cg-tu-title' });
+      --brand-green: #10a37f;
+      --brand-green-hover: #0d8c6d;
+      --brand-green-active: #097056;
+      --brand-green-subtle: #ecfdf5;
+      --brand-green-border: #a7f3d0;
+      --brand-green-text: #047857;
 
-  const btnClose = el('button', 'btn-close', null, titleRow, {
-    type: 'button',
-    'aria-label': '关闭',
-    title: '关闭 (Esc)'
-  });
-  btnClose.innerHTML = SVG_CLOSE;
+      --accent-blue: #2563eb;
+      --accent-blue-subtle: #eff6ff;
+      --accent-blue-border: #bfdbfe;
+      --accent-blue-text: #1d4ed8;
 
-  el('div', 'subtitle-note', '按参考费率估算，非实际账单 · 数据可能有延迟', headerEl);
+      --accent-purple: #7c3aed;
+      --accent-purple-subtle: #f5f3ff;
+      --accent-purple-border: #ddd6fe;
+      --accent-purple-text: #6d28d9;
 
-  // Controls Row: ViewMode + Presets + Custom Range
-  const controlsRow = el('div', 'controls-row', null, headerEl);
-  const controlsLeft = el('div', 'controls-left', null, controlsRow);
-  const controlsRight = el('div', 'controls-right', null, controlsRow);
+      --accent-emerald: #059669;
+      --accent-emerald-subtle: #ecfdf5;
 
-  // Segmented control: Personal vs Team
-  const segGroup = el('div', 'segmented-group', null, controlsLeft);
-  const btnViewPersonal = el('button', 'segmented-btn active', '个人用量', segGroup, {
-    type: 'button',
-    'aria-pressed': 'true'
-  });
-  const btnViewTeam = el('button', 'segmented-btn', '团队用量', segGroup, {
-    type: 'button',
-    'aria-pressed': 'false'
-  });
+      --accent-amber: #d97706;
+      --accent-amber-subtle: #fffbeb;
+      --accent-amber-border: #fde68a;
+      --accent-amber-text: #b45309;
 
-  // Presets
-  const btnPresetCycle = el('button', 'btn-preset', '本周期', controlsLeft, { type: 'button' });
-  const btnPreset7d = el('button', 'btn-preset', '近7天', controlsLeft, { type: 'button' });
-  const btnPreset30d = el('button', 'btn-preset', '近30天', controlsLeft, { type: 'button' });
+      --accent-red: #dc2626;
+      --accent-red-subtle: #fef2f2;
+      --accent-red-border: #fecaca;
+      --accent-red-text: #991b1b;
 
-  // Custom date range
-  const dateGroup = el('div', 'date-group', null, controlsRight);
-  el('span', null, '开始', dateGroup);
-  const inputStartDate = el('input', 'date-input', null, dateGroup, {
-    type: 'date',
-    'aria-label': '开始日期'
-  });
-  el('span', null, '结束', dateGroup);
-  const inputEndDate = el('input', 'date-input', null, dateGroup, {
-    type: 'date',
-    'aria-label': '结束日期'
-  });
-  const btnApplyDates = el('button', 'btn-apply', '查询', controlsRight, { type: 'button' });
+      --track-bg: #f1f5f9;
+      --scrollbar-thumb: #cbd5e1;
+      --scrollbar-thumb-hover: #94a3b8;
 
-  // Loading Progress Bar
-  const loadingBarWrap = el('div', 'loading-bar-wrap', null, headerEl);
-  el('div', 'loading-bar-inner', null, loadingBarWrap);
-  loadingBarWrap.style.display = 'none';
+      --shadow-modal: 0 25px 50px -12px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(0, 0, 0, 0.06);
+      --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05);
 
-  // Scrollable Body
-  const modalBodyEl = el('div', 'modal-body', null, dialogEl);
+      --radius-modal: 16px;
+      --radius-card: 12px;
+      --radius-btn: 8px;
+      --radius-pill: 9999px;
 
-  // Modal Footer
-  const footerEl = el('div', 'modal-footer', null, dialogEl);
-  const footerStatusText = el('span', null, '数据可能有延迟', footerEl);
-  const footerActions = el('div', 'footer-actions', null, footerEl);
-
-  const btnRefresh = el('button', 'btn-action', null, footerActions, { type: 'button' });
-  btnRefresh.innerHTML = SVG_REFRESH + '<span>刷新</span>';
-
-  const btnExportCsv = el('button', 'btn-action', null, footerActions, { type: 'button' });
-  btnExportCsv.innerHTML = SVG_DOWNLOAD + '<span>导出 CSV</span>';
-
-  const btnExportJson = el('button', 'btn-action', null, footerActions, { type: 'button' });
-  btnExportJson.innerHTML = SVG_DOWNLOAD + '<span>导出 JSON</span>';
-
-  const btnCloseBottom = el('button', 'btn-action', '关闭', footerActions, { type: 'button' });
-
-  // Event Handlers for Header Controls
-  btnViewPersonal.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    if (snapshot.viewMode !== 'personal') {
-      genericErrorMessage = null;
-      invokeSetView('personal');
+      position: fixed;
+      inset: 0;
+      z-index: 2147483647;
+      display: block;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
-  });
 
-  btnViewTeam.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    if (snapshot.viewMode !== 'team') {
-      genericErrorMessage = null;
-      invokeSetView('team');
+    @media (prefers-color-scheme: dark) {
+      :host {
+        --bg-backdrop: rgba(0, 0, 0, 0.72);
+        --bg-modal: #1e1e24;
+        --bg-header: #22222a;
+        --bg-subtle: #17171c;
+        --bg-card: #23232b;
+        --bg-card-hover: #2b2b35;
+        --bg-input: #17171c;
+        --bg-table-header: #1b1b22;
+        --bg-table-row-hover: #272732;
+        --bg-table-zebra: #202028;
+        --bg-table-footer: #1b1b22;
+        --bg-details: #18181f;
+        --bg-details-card: #23232b;
+        --bg-tag: #2a2a34;
+        --bg-pre: #141418;
+
+        --border: #33333f;
+        --border-subtle: #282832;
+        --border-strong: #4a4a58;
+        --border-focus: #10a37f;
+
+        --text-primary: #f1f5f9;
+        --text-secondary: #cbd5e1;
+        --text-muted: #8892a4;
+        --text-inverse: #0f172a;
+
+        --brand-green: #10a37f;
+        --brand-green-hover: #1ab890;
+        --brand-green-active: #0d8c6d;
+        --brand-green-subtle: rgba(16, 163, 127, 0.16);
+        --brand-green-border: rgba(16, 163, 127, 0.42);
+        --brand-green-text: #34d399;
+
+        --accent-blue: #3b82f6;
+        --accent-blue-subtle: rgba(59, 130, 246, 0.16);
+        --accent-blue-border: rgba(59, 130, 246, 0.42);
+        --accent-blue-text: #93c5fd;
+
+        --accent-purple: #a78bfa;
+        --accent-purple-subtle: rgba(167, 139, 250, 0.16);
+        --accent-purple-border: rgba(167, 139, 250, 0.42);
+        --accent-purple-text: #c4b5fd;
+
+        --accent-emerald: #34d399;
+        --accent-emerald-subtle: rgba(52, 211, 153, 0.15);
+
+        --accent-amber: #fbbf24;
+        --accent-amber-subtle: rgba(251, 191, 36, 0.16);
+        --accent-amber-border: rgba(251, 191, 36, 0.42);
+        --accent-amber-text: #fde68a;
+
+        --accent-red: #f87171;
+        --accent-red-subtle: rgba(248, 113, 113, 0.16);
+        --accent-red-border: rgba(248, 113, 113, 0.42);
+        --accent-red-text: #fca5a5;
+
+        --track-bg: #141418;
+        --scrollbar-thumb: #3e3e4e;
+        --scrollbar-thumb-hover: #58586c;
+
+        --shadow-modal: 0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.08);
+        --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.35), 0 1px 2px -1px rgba(0, 0, 0, 0.25);
+      }
     }
-  });
 
-  btnPresetCycle.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    dateInputDirty = false;
-    genericErrorMessage = null;
-    invokeLoad({ preset: 'cycle', viewMode: snapshot.viewMode || 'personal' });
-  });
+    * { box-sizing: border-box; }
 
-  btnPreset7d.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    dateInputDirty = false;
-    genericErrorMessage = null;
-    invokeLoad({ preset: '7d', viewMode: snapshot.viewMode || 'personal' });
-  });
-
-  btnPreset30d.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    dateInputDirty = false;
-    genericErrorMessage = null;
-    invokeLoad({ preset: '30d', viewMode: snapshot.viewMode || 'personal' });
-  });
-
-  inputStartDate.addEventListener('input', () => {
-    localStartDate = inputStartDate.value;
-    dateInputDirty = true;
-  });
-
-  inputEndDate.addEventListener('input', () => {
-    localEndDate = inputEndDate.value;
-    dateInputDirty = true;
-  });
-
-  btnApplyDates.addEventListener('click', () => {
-    if (snapshot.status === 'loading') return;
-    if (!localStartDate || !localEndDate || localStartDate > localEndDate) {
-      genericErrorMessage = '请选择有效的起止日期（开始日期不能晚于结束日期）';
-      renderModalContent();
-      return;
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: var(--bg-backdrop);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: max(14px, env(safe-area-inset-top, 14px)) max(14px, env(safe-area-inset-right, 14px)) max(14px, env(safe-area-inset-bottom, 14px)) max(14px, env(safe-area-inset-left, 14px));
+      animation: backdropFadeIn 0.2s ease-out;
+      overflow: hidden;
     }
-    dateInputDirty = false;
-    genericErrorMessage = null;
-    invokeLoad({
-      startDate: localStartDate,
-      endDate: localEndDate,
-      viewMode: snapshot.viewMode || 'personal'
+    @keyframes backdropFadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .modal-card {
+      display: flex;
+      flex-direction: column;
+      width: clamp(320px, 94vw, 1560px);
+      max-width: 95vw;
+      max-height: 88vh;
+      max-height: min(88vh, 88dvh);
+      background: var(--bg-modal);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-modal);
+      box-shadow: var(--shadow-modal);
+      overflow: hidden;
+      animation: modalSlideUp 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes modalSlideUp {
+      from { opacity: 0; transform: translateY(14px) scale(0.985); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 22px;
+      background: var(--bg-header);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .header-left {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      min-width: 0;
+    }
+    .header-title {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 0;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--text-primary);
+    }
+    .header-icon { font-size: 18px; line-height: 1; }
+    .title-text { font-size: 16px; font-weight: 700; color: var(--text-primary); }
+
+    .header-delay-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: var(--radius-pill);
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--accent-amber-subtle);
+      color: var(--accent-amber-text);
+      border: 1px solid var(--accent-amber-border);
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+    .delay-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-amber);
+      flex-shrink: 0;
+    }
+
+    .version, .mode-badge, .model-pill, .speed-pill, .estimate-pill, .client-label {
+      display: inline-flex;
+      align-items: center;
+      border-radius: var(--radius-pill);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+      line-height: 1.2;
+    }
+    .version {
+      padding: 2px 7px;
+      color: var(--text-secondary);
+      background: var(--bg-tag);
+      border: 1px solid var(--border);
+    }
+    .mode-badge {
+      padding: 2px 8px;
+      color: var(--accent-blue-text);
+      background: var(--accent-blue-subtle);
+      border: 1px solid var(--accent-blue-border);
+    }
+    .mode-badge.personal {
+      color: var(--brand-green-text);
+      background: var(--brand-green-subtle);
+      border-color: var(--brand-green-border);
+    }
+
+    .view-switch {
+      display: inline-flex;
+      padding: 3px;
+      background: var(--bg-tag);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      gap: 3px;
+    }
+    .view-switch-btn {
+      min-height: 28px;
+      padding: 0 12px;
+      color: var(--text-secondary);
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s ease;
+    }
+    .view-switch-btn:hover:not(:disabled) {
+      color: var(--text-primary);
+    }
+    .view-switch-btn.active {
+      color: var(--brand-green-text);
+      background: var(--bg-modal);
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
+    .view-switch-btn:disabled {
+      color: var(--text-muted);
+      cursor: not-allowed;
+    }
+
+    .close-btn {
+      width: 36px;
+      height: 36px;
+      min-width: 36px;
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      color: var(--text-secondary);
+      background: transparent;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .close-btn:hover {
+      color: var(--text-primary);
+      background: var(--bg-card-hover);
+    }
+    .close-btn:active {
+      transform: scale(0.96);
+    }
+
+    .range-bar {
+      padding: 14px 22px;
+      background: var(--bg-subtle);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .date-fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .field-group { min-width: 0; }
+    .field-group label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    input[type='date'] {
+      display: block;
+      width: 100%;
+      height: 38px;
+      min-height: 38px;
+      padding: 0 10px;
+      color: var(--text-primary);
+      background: var(--bg-input);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-btn);
+      font-family: inherit;
+      font-size: 12px;
+      outline: none;
+      color-scheme: light;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    @media (prefers-color-scheme: dark) {
+      input[type='date'] {
+        color-scheme: dark;
+      }
+    }
+    input[type='date']:focus {
+      border-color: var(--brand-green);
+      box-shadow: 0 0 0 3px var(--brand-green-subtle);
+    }
+
+    button { font-family: inherit; }
+    .primary-btn {
+      height: 38px;
+      min-height: 38px;
+      padding: 0 20px;
+      color: #ffffff;
+      background: var(--brand-green);
+      border: 1px solid var(--brand-green);
+      border-radius: var(--radius-btn);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .primary-btn:hover {
+      background: var(--brand-green-hover);
+      border-color: var(--brand-green-hover);
+      box-shadow: 0 2px 8px rgba(16, 163, 127, 0.25);
+    }
+    .primary-btn:active {
+      transform: scale(0.97);
+      background: var(--brand-green-active);
+    }
+    .primary-btn:disabled, .mini-btn:disabled, .footer-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .presets-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .presets {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .preset-label {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .mini-btn {
+      height: 28px;
+      min-height: 28px;
+      padding: 0 10px;
+      color: var(--text-secondary);
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s ease;
+    }
+    .mini-btn:hover {
+      color: var(--text-primary);
+      background: var(--bg-card-hover);
+      border-color: var(--text-muted);
+    }
+    .mini-btn:active {
+      transform: scale(0.96);
+    }
+    .cycle-hint {
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+
+    .panel-body {
+      flex: 1;
+      min-height: 0;
+      padding: clamp(14px, 2vw, 22px);
+      overflow-y: auto;
+      background: var(--bg-modal);
+      position: relative;
+    }
+    .panel-body::-webkit-scrollbar, .table-box::-webkit-scrollbar, pre::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .panel-body::-webkit-scrollbar-track, .table-box::-webkit-scrollbar-track, pre::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .panel-body::-webkit-scrollbar-thumb, .table-box::-webkit-scrollbar-thumb, pre::-webkit-scrollbar-thumb {
+      background: var(--scrollbar-thumb);
+      border-radius: var(--radius-pill);
+    }
+    .panel-body::-webkit-scrollbar-thumb:hover, .table-box::-webkit-scrollbar-thumb:hover, pre::-webkit-scrollbar-thumb:hover {
+      background: var(--scrollbar-thumb-hover);
+    }
+
+    /* Two-Column Continuous Stream Layout (Academic Paper Style) */
+    .two-column-layout {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      width: 100%;
+      min-width: 0;
+    }
+
+    .column-left,
+    .column-right {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+      width: 100%;
+    }
+
+    .kpi-grid-left {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .kpi-grid-right {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .kpi-grid-right > .summary-card {
+      height: 100%;
+    }
+
+    .notice-wrap {
+      width: 100%;
+      min-width: 0;
+    }
+
+    .quota-card, .summary-card, .section {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-card);
+      box-shadow: var(--shadow-card);
+    }
+    .quota-card {
+      padding: 16px 18px;
+      margin: 0;
+    }
+    .card-top, .section-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .eyebrow-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .quota-icon { font-size: 14px; line-height: 1; }
+    .eyebrow {
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .quota-name {
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .progress-track {
+      height: 10px;
+      margin: 11px 0 9px;
+      overflow: hidden;
+      background: var(--track-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-pill);
+    }
+    .progress-fill {
+      height: 100%;
+      border-radius: inherit;
+      transition: width 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .progress-fill.ok { background: linear-gradient(90deg, #10b981, #34d399); }
+    .progress-fill.warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+    .progress-fill.danger { background: linear-gradient(90deg, #ef4444, #f87171); }
+    .quota-stats {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+    .quota-stat-item strong {
+      color: var(--text-primary);
+    }
+    .quota-stat-divider {
+      color: var(--border-strong);
+    }
+
+    /* Redesigned Prominent Quota Estimate Cards */
+    .quota-estimate-cards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 12px 0 10px;
+    }
+    .quota-estimate-card {
+      padding: 12px 14px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-btn);
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .estimate-card-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px;
+    }
+    .estimate-tag {
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: var(--brand-green-subtle);
+      color: var(--brand-green-text);
+      border: 1px solid var(--brand-green-border);
+    }
+    .estimate-card-value {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--text-primary);
+      margin: 4px 0 2px;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+    .quota-estimate-card.remaining .estimate-card-value {
+      color: var(--accent-emerald);
+    }
+    .estimate-card-hint {
+      font-size: 10px;
+      color: var(--text-muted);
+      line-height: 1.3;
+    }
+    .quota-estimate-unavailable {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 10px 12px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin: 10px 0 8px;
+      line-height: 1.45;
+    }
+    .quota-notice-box {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 8px 12px;
+      background: var(--accent-blue-subtle);
+      border: 1px solid var(--accent-blue-border);
+      border-radius: 6px;
+      font-size: 11px;
+      color: var(--accent-blue-text);
+      line-height: 1.45;
+      margin-top: 10px;
+    }
+    .quota-notice-icon {
+      font-size: 13px;
+      line-height: 1.2;
+      flex-shrink: 0;
+    }
+
+    .summary-card {
+      min-width: 0;
+      min-height: 110px;
+      padding: 14px 16px;
+      margin: 0;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .summary-card:hover {
+      border-color: var(--border-strong);
+      box-shadow: 0 4px 8px -1px rgba(0, 0, 0, 0.08);
+    }
+    .card-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .card-label {
+      color: var(--text-secondary);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .card-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+    .card-badge.tokens { background: var(--accent-purple-subtle); color: var(--accent-purple-text); }
+    .card-badge.cost { background: var(--brand-green-subtle); color: var(--brand-green-text); }
+    .card-badge.activity { background: var(--accent-blue-subtle); color: var(--accent-blue-text); }
+
+    .card-value {
+      margin: 6px 0 4px;
+      overflow: hidden;
+      color: var(--text-primary);
+      font-size: clamp(20px, 2.2vw, 24px);
+      font-weight: 750;
+      letter-spacing: -0.02em;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .cost-value { color: var(--accent-emerald); }
+    .card-unit { font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-left: 2px; }
+    .card-sub {
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+    .sub-dot {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .sub-dot.uncached { background: var(--text-muted); }
+    .sub-dot.cached { background: var(--accent-blue); }
+
+    .mini-bars {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .mini-bar-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .mini-bar-name {
+      width: 64px;
+      font-size: 10px;
+      color: var(--text-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .mini-bar {
+      flex: 1;
+      height: 5px;
+      overflow: hidden;
+      background: var(--track-bg);
+      border-radius: var(--radius-pill);
+    }
+    .mini-bar span {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent-purple);
+    }
+
+    .section {
+      margin: 0;
+      padding: 16px 18px;
+    }
+    .section-title-row { margin-bottom: 12px; }
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .section-icon { font-size: 14px; line-height: 1; }
+    .section-note {
+      color: var(--text-muted);
+      font-size: 11px;
+      text-align: right;
+    }
+    .section-footnote {
+      color: var(--text-muted);
+      font-size: 11px;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+
+    .table-box {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-card);
+      -webkit-overflow-scrolling: touch;
+    }
+    table {
+      width: 100%;
+      min-width: 540px;
+      border-collapse: collapse;
+      color: var(--text-primary);
+      font-size: 12px;
+      text-align: left;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 10px 12px;
+      color: var(--text-secondary);
+      background: var(--bg-table-header);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+    th.num-th { text-align: right; }
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-subtle);
+      vertical-align: middle;
+      white-space: nowrap;
+      color: var(--text-primary);
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: var(--bg-table-row-hover); }
+    tfoot tr {
+      background: var(--bg-table-footer);
+      border-top: 2px solid var(--border);
+    }
+    tfoot td {
+      padding: 10px 12px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .num {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      text-align: right;
+    }
+    .money {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      color: var(--accent-emerald);
+      font-weight: 600;
+      text-align: right;
+    }
+
+    .model-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .model-color-indicator {
+      width: 3px;
+      height: 16px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+    .model-pill {
+      max-width: 150px;
+      padding: 2px 7px;
+      overflow: hidden;
+      color: var(--accent-purple-text);
+      background: var(--accent-purple-subtle);
+      border: 1px solid var(--accent-purple-border);
+      text-overflow: ellipsis;
+      vertical-align: middle;
+    }
+    .speed-pill {
+      padding: 1px 5px;
+      color: var(--accent-amber-text);
+      background: var(--accent-amber-subtle);
+      border: 1px solid var(--accent-amber-border);
+      font-size: 10px;
+    }
+    .estimate-pill {
+      padding: 1px 5px;
+      color: var(--accent-blue-text);
+      background: var(--accent-blue-subtle);
+      border: 1px solid var(--accent-blue-border);
+      font-size: 10px;
+    }
+    .fallback { color: var(--accent-amber); }
+    .client-label {
+      padding: 2px 8px;
+      color: var(--text-secondary);
+      background: var(--bg-tag);
+      border: 1px solid var(--border-strong);
+    }
+    .user-name {
+      display: block;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+    .user-email {
+      display: block;
+      max-width: 180px;
+      overflow: hidden;
+      color: var(--text-muted);
+      font-size: 11px;
+      text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+
+    .date-cell {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+    .expand-icon {
+      display: inline-block;
+      font-size: 9px;
+      color: var(--text-muted);
+      transition: transform 0.15s ease;
+      line-height: 1;
+    }
+    .daily-row { cursor: pointer; user-select: none; }
+    .daily-row.is-open {
+      background: var(--bg-table-row-hover);
+      font-weight: 500;
+    }
+    .daily-row.is-open .expand-icon {
+      color: var(--brand-green);
+    }
+    .details-row td {
+      padding: 0;
+      white-space: normal;
+      background: var(--bg-details);
+    }
+    .day-details {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .day-model {
+      min-width: 0;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent-purple);
+      background: var(--bg-details-card);
+      border-radius: 6px;
+      font-size: 11px;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+    }
+    .day-model-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 3px;
+    }
+    .day-model-header strong {
+      font-size: 12px;
+      color: var(--text-primary);
+    }
+    .speed-tag {
+      font-size: 10px;
+      color: var(--text-muted);
+      background: var(--bg-tag);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .day-model-body {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--text-secondary);
+    }
+
+    .notice {
+      margin: 0;
+      padding: 12px 14px;
+      border: 1px solid var(--accent-blue-border);
+      border-radius: 8px;
+      color: var(--accent-blue-text);
+      background: var(--accent-blue-subtle);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .error-banner {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 14px;
+      padding: 12px 16px;
+      color: var(--accent-red-text);
+      background: var(--accent-red-subtle);
+      border: 1px solid var(--accent-red-border);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .error-icon {
+      font-size: 16px;
+      line-height: 1.2;
+      flex-shrink: 0;
+    }
+    .error-body {
+      flex: 1;
+      min-width: 0;
+    }
+    .error-title {
+      font-weight: 700;
+      margin-bottom: 2px;
+    }
+    .error-text {
+      word-break: break-word;
+      white-space: pre-wrap;
+    }
+    .empty {
+      padding: 24px 16px;
+      color: var(--text-muted);
+      font-size: 12px;
+      text-align: center;
+      line-height: 1.5;
+    }
+    .empty-state {
+      padding: 48px 24px;
+      text-align: center;
+    }
+    .empty-icon {
+      font-size: 38px;
+      margin-bottom: 12px;
+      opacity: 0.65;
+    }
+    .empty-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 6px;
+    }
+    .empty-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+      max-width: 320px;
+      margin: 0 auto;
+      line-height: 1.5;
+    }
+
+    .loading-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 4px 0 10px;
+    }
+    .skeleton-layout {
+      width: 100%;
+    }
+    .skeleton {
+      background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 37%, #f1f5f9 63%);
+      background-size: 400% 100%;
+      animation: skeletonShimmer 1.4s ease infinite;
+      border-radius: var(--radius-card);
+      border: 1px solid var(--border);
+    }
+    @media (prefers-color-scheme: dark) {
+      .skeleton {
+        background: linear-gradient(90deg, #23232b 25%, #2d2d38 37%, #23232b 63%);
+        background-size: 400% 100%;
+        border-color: var(--border);
+      }
+    }
+    @keyframes skeletonShimmer {
+      0% { background-position: 100% 50%; }
+      100% { background-position: 0 50%; }
+    }
+    .card-sk { height: 110px; min-height: 110px; }
+    .quota-sk { height: 125px; min-height: 125px; }
+    .table-sk-sm { height: 175px; min-height: 175px; }
+    .table-sk-lg { height: 250px; min-height: 250px; }
+
+    .loading-text {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: var(--text-secondary);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    .content-loading-overlay {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding-top: 12px;
+      pointer-events: none;
+      background: transparent;
+    }
+    .content-loading-overlay[hidden] {
+      display: none !important;
+    }
+    .loading-progress-line {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2.5px;
+      background: linear-gradient(90deg, transparent, var(--brand-green), transparent);
+      background-size: 200% 100%;
+      animation: progressSlide 1.2s infinite linear;
+    }
+    @keyframes progressSlide {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .content-loading-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border: 1px solid var(--brand-green-border);
+      border-radius: var(--radius-pill);
+      background: var(--bg-card);
+      color: var(--brand-green-text);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+      font-size: 12px;
+      font-weight: 600;
+      animation: statusFadeIn 0.2s ease-out;
+    }
+    @keyframes statusFadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--brand-green-border);
+      border-top-color: var(--brand-green);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    .btn-spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(255, 255, 255, 0.4);
+      border-top-color: #ffffff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .footer {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .export-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .footer-btn {
+      height: 36px;
+      min-height: 36px;
+      padding: 0 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-btn);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+    .footer-btn:hover {
+      color: var(--text-primary);
+      background: var(--bg-card-hover);
+      border-color: var(--text-muted);
+    }
+    .footer-btn:active {
+      transform: scale(0.97);
+    }
+    .footer-btn.refresh {
+      background: var(--brand-green);
+      color: #ffffff;
+      border-color: var(--brand-green);
+      font-weight: 600;
+    }
+    .footer-btn.refresh:hover {
+      background: var(--brand-green-hover);
+      border-color: var(--brand-green-hover);
+    }
+
+    .raw-json {
+      width: 100%;
+      margin-top: 6px;
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    .raw-json summary {
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 500;
+      user-select: none;
+    }
+    pre {
+      max-height: 250px;
+      margin: 8px 0 0;
+      padding: 10px 12px;
+      overflow: auto;
+      color: var(--text-secondary);
+      background: var(--bg-pre);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    summary:focus-visible {
+      outline: 2px solid var(--brand-green);
+      outline-offset: 2px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      ::before,
+      ::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    /* Breakpoint: Wide Screens (>= 1100px) - Academic Paper Continuous Two-Column Layout */
+    @media (min-width: 1100px) {
+      .two-column-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1.02fr) minmax(0, 0.98fr);
+        gap: 20px;
+        align-items: start;
+      }
+      .column-left {
+        border-right: 1px solid var(--border-subtle);
+        padding-right: 20px;
+      }
+      .range-bar {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 16px;
+        flex-wrap: wrap;
+      }
+      .date-fields {
+        display: flex;
+        align-items: flex-end;
+        gap: 10px;
+        flex: 1 1 auto;
+      }
+      .field-group {
+        width: 165px;
+      }
+      .presets-row {
+        margin-top: 0;
+        gap: 12px;
+        flex: 0 0 auto;
+      }
+    }
+
+    /* Breakpoint 1: Medium Screens (<= 900px) */
+    @media (max-width: 900px) {
+      .range-bar {
+        padding: 12px 18px;
+      }
+      .panel-body {
+        padding: 16px 18px;
+      }
+    }
+
+    /* Breakpoint 2: Small Screens / Mobile (<= 640px) */
+    @media (max-width: 640px) {
+      .modal-backdrop {
+        padding: max(8px, env(safe-area-inset-top, 8px)) max(8px, env(safe-area-inset-right, 8px)) max(8px, env(safe-area-inset-bottom, 8px)) max(8px, env(safe-area-inset-left, 8px));
+      }
+      .modal-card {
+        width: 100%;
+        max-height: 94vh;
+        max-height: min(94vh, 94dvh);
+        border-radius: 12px;
+      }
+      .header {
+        padding: 12px 14px;
+        gap: 8px;
+      }
+      .header-title {
+        font-size: 15px;
+      }
+      .title-text {
+        font-size: 15px;
+      }
+      .header-delay-pill {
+        font-size: 10px;
+        padding: 2px 7px;
+      }
+      .range-bar {
+        padding: 12px 14px;
+      }
+      .date-fields {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .primary-btn {
+        width: 100%;
+        min-height: 42px;
+        font-size: 14px;
+      }
+      .presets-row {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+      }
+      .presets {
+        flex-wrap: wrap;
+        justify-content: flex-start;
+      }
+      .mini-btn {
+        min-height: 36px;
+        padding: 0 12px;
+        font-size: 12px;
+      }
+      .view-switch {
+        width: 100%;
+        display: flex;
+      }
+      .view-switch-btn {
+        flex: 1;
+        min-height: 36px;
+        font-size: 12px;
+      }
+      .kpi-grid-left,
+      .quota-estimate-cards {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .summary-card {
+        min-height: auto;
+        padding: 14px;
+      }
+      .panel-body {
+        padding: 14px;
+      }
+      .section {
+        padding: 14px;
+      }
+      .footer {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+      }
+      .export-group {
+        width: 100%;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .export-group .footer-btn {
+        width: 100%;
+        min-height: 40px;
+      }
+      .footer-btn.refresh {
+        width: 100%;
+        min-height: 42px;
+        font-size: 13px;
+      }
+    }
+
+    /* Breakpoint 3: Extra Narrow Screens (<= 420px) */
+    @media (max-width: 420px) {
+      .modal-backdrop {
+        padding: 4px;
+      }
+      .modal-card {
+        max-height: 98vh;
+        max-height: min(98vh, 98dvh);
+        border-radius: 10px;
+      }
+      .header {
+        padding: 10px 12px;
+      }
+      .title-text {
+        font-size: 14px;
+      }
+      .range-bar {
+        padding: 10px 12px;
+      }
+      .panel-body {
+        padding: 12px 10px 18px;
+      }
+      .section {
+        padding: 12px 10px;
+      }
+      th, td {
+        padding: 8px 9px;
+        font-size: 11px;
+      }
+      .model-pill {
+        max-width: 110px;
+        font-size: 10px;
+      }
+      .card-value,
+      .estimate-card-value {
+        font-size: 19px;
+      }
+      .day-details {
+        grid-template-columns: 1fr;
+        padding: 8px 10px;
+      }
+    }
+  `;
+
+
+  const HTML_ESCAPE = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => HTML_ESCAPE[ch]);
+  const asArray = (value) => (Array.isArray(value) ? value : []);
+  const hasOwn = (obj, key) => Boolean(obj && Object.prototype.hasOwnProperty.call(obj, key));
+  const n = (value) => {
+    if (typeof value === 'string') value = value.replace(/,/g, '').trim();
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const clamp = (value, min = 0, max = 1) => Math.min(max, Math.max(min, n(value)));
+  const trimFixed = (value, digits = 2) => n(value).toFixed(digits).replace(/\.?0+$/, '');
+  const pad2 = (value) => String(value).padStart(2, '0');
+
+  const isUnavailable = (value) => {
+    if (value === null || value === undefined || value === '') return true;
+    if (typeof value === 'boolean') return true;
+    if (typeof value === 'string') {
+      const cleaned = value.replace(/,/g, '').trim();
+      if (!cleaned) return true;
+      return !Number.isFinite(Number(cleaned));
+    }
+    return !Number.isFinite(Number(value));
+  };
+
+  const fmtNum = (value) => {
+    if (isUnavailable(value)) return '—';
+    const number = typeof value === 'string' ? Number(value.replace(/,/g, '').trim()) : Number(value);
+    const absolute = Math.abs(number);
+    const sign = number < 0 ? '-' : '';
+    if (absolute >= 1e12) return `${sign}${trimFixed(absolute / 1e12)}T`;
+    if (absolute >= 1e9) return `${sign}${trimFixed(absolute / 1e9)}B`;
+    if (absolute >= 1e6) return `${sign}${trimFixed(absolute / 1e6)}M`;
+    if (absolute >= 1e3) return `${sign}${trimFixed(absolute / 1e3)}K`;
+    return number.toLocaleString('en-US');
+  };
+
+  const fmtFullNum = (value) => {
+    if (isUnavailable(value)) return '—';
+    const number = typeof value === 'string' ? Number(value.replace(/,/g, '').trim()) : Number(value);
+    return number.toLocaleString('en-US');
+  };
+
+  const fmtUsd = (value) => {
+    if (isUnavailable(value)) return '—';
+    const number = typeof value === 'string' ? Number(value.replace(/,/g, '').trim()) : Number(value);
+    return `$${number.toFixed(2)}`;
+  };
+
+  const fmtTurns = (value) => {
+    if (isUnavailable(value)) return '—';
+    const number = typeof value === 'string' ? Number(value.replace(/,/g, '').trim()) : Number(value);
+    return Math.abs(number - Math.round(number)) < 1e-9
+      ? String(Math.round(number))
+      : number.toFixed(1);
+  };
+
+  const hasNumericField = (obj, key) =>
+    hasOwn(obj, key) && obj[key] !== null && obj[key] !== undefined && typeof obj[key] !== 'boolean' && Number.isFinite(Number(obj[key]));
+
+  const formatPercentFromRatio = (ratio) => {
+    const percent = clamp(ratio) * 100;
+    return `${percent >= 10 ? percent.toFixed(1) : percent.toFixed(2)}%`;
+  };
+
+  const formatDuration = (seconds) => {
+    const days = n(seconds) / 86400;
+    if (!days) return '当前配额周期';
+    return days >= 1 ? `${trimFixed(days, 1)} 天周期` : `${trimFixed(n(seconds) / 3600, 1)} 小时周期`;
+  };
+
+  const toEpochMs = (value) => {
+    if (typeof value === 'string') {
+      const numeric = Number(value.trim());
+      if (Number.isFinite(numeric) && numeric > 0) return numeric > 1e12 ? numeric : numeric * 1000;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : NaN;
+    }
+    const numeric = n(value);
+    return numeric ? (numeric > 1e12 ? numeric : numeric * 1000) : NaN;
+  };
+
+  const formatDateTime = (ms) => {
+    const date = new Date(ms);
+    if (!Number.isFinite(date.getTime())) return '—';
+    return date.toLocaleString('zh-CN', {
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
     });
-  });
+  };
 
-  function handleRetryOrRefresh() {
-    if (snapshot.status === 'loading') return;
-    genericErrorMessage = null;
-    const vm = snapshot.viewMode || 'personal';
-    if (localStartDate && localEndDate && dateInputDirty) {
-      invokeLoad({
-        startDate: localStartDate,
-        endDate: localEndDate,
-        viewMode: vm
-      });
-    } else if (snapshot.range && snapshot.range.startDate && snapshot.range.endDate) {
-      invokeLoad({
-        startDate: snapshot.range.startDate,
-        endDate: snapshot.range.endDate,
-        viewMode: vm
-      });
+  const dateKeyFromMs = (ms) => {
+    const date = new Date(ms);
+    if (!Number.isFinite(date.getTime())) return '';
+    if (CONFIG.USE_UTC_DAY) return date.toISOString().slice(0, 10);
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  };
+
+  const dayStartMs = (dateKey) => {
+    const [year, month, day] = String(dateKey || '').slice(0, 10).split('-').map(Number);
+    if (!year || !month || !day) return NaN;
+    return CONFIG.USE_UTC_DAY ? Date.UTC(year, month - 1, day) : new Date(year, month - 1, day).getTime();
+  };
+
+  const addDays = (dateKey, days) => {
+    const ms = dayStartMs(dateKey);
+    return Number.isFinite(ms) ? dateKeyFromMs(ms + days * CONFIG.DAY_MS) : '';
+  };
+
+  const validateRange = (startDate, endDate) => {
+    if (!startDate || !endDate) throw new Error('请同时选择开始日期和结束日期。');
+    const startMs = dayStartMs(startDate);
+    const endMs = dayStartMs(endDate);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) throw new Error('日期格式无效。');
+    if (startMs > endMs) throw new Error('开始日期不能晚于结束日期。');
+    if (Math.floor((endMs - startMs) / CONFIG.DAY_MS) + 1 > CONFIG.MAX_RANGE_DAYS) {
+      throw new Error(`单次查询范围不能超过 ${CONFIG.MAX_RANGE_DAYS} 天。`);
+    }
+  };
+
+  const usedRatioFromWindow = (window) => {
+    if (!window || window.available === false) return 0;
+    for (const key of ['used_ratio', 'usedRatio', 'fraction_used']) {
+      if (hasOwn(window, key) && window[key] !== null && window[key] !== undefined && typeof window[key] !== 'boolean' && Number.isFinite(Number(window[key]))) {
+        return clamp(Number(window[key]));
+      }
+    }
+    for (const key of ['used_percent', 'usedPercent']) {
+      if (hasOwn(window, key) && window[key] !== null && window[key] !== undefined && typeof window[key] !== 'boolean' && Number.isFinite(Number(window[key]))) {
+        return clamp(Number(window[key]) / 100);
+      }
+    }
+    const limit = window.limit ?? window.credit_limit ?? window.credits_limit ?? window.max;
+    const used = window.used ?? window.used_credits ?? window.consumed ?? window.consumed_credits;
+    const remaining = window.remaining ?? window.remaining_credits;
+    if (limit && Number.isFinite(Number(limit)) && Number(limit) > 0) {
+      if (used !== null && used !== undefined && typeof used !== 'boolean' && Number.isFinite(Number(used))) {
+        return clamp(Number(used) / Number(limit));
+      }
+      if (remaining !== null && remaining !== undefined && typeof remaining !== 'boolean' && Number.isFinite(Number(remaining))) {
+        return clamp((Number(limit) - Number(remaining)) / Number(limit));
+      }
+    }
+    return 0;
+  };
+
+  const usedPercentTextFromWindow = (window) => {
+    if (!window || window.available === false) return '未知';
+    for (const key of ['used_percent', 'usedPercent']) {
+      if (hasOwn(window, key) && window[key] !== null && window[key] !== undefined && typeof window[key] !== 'boolean' && Number.isFinite(Number(window[key]))) {
+        return `${trimFixed(Number(window[key]))}%`;
+      }
+    }
+    const hasRatio = ['used_ratio', 'usedRatio', 'fraction_used'].some((k) => hasOwn(window, k) && window[k] !== null && window[k] !== undefined && typeof window[k] !== 'boolean' && Number.isFinite(Number(window[k])));
+    if (hasRatio) {
+      const ratio = usedRatioFromWindow(window);
+      return formatPercentFromRatio(ratio);
+    }
+    return '未知';
+  };
+
+  const quotaValue = (window, keys) => {
+    for (const key of keys) {
+      if (window && Object.prototype.hasOwnProperty.call(window, key) && window[key] !== null && window[key] !== undefined) {
+        if (typeof window[key] === 'boolean') continue;
+        return window[key];
+      }
+    }
+    return null;
+  };
+
+  const getWindowDurationSeconds = (window) => {
+    if (!window) return 0;
+    for (const key of ['limit_window_seconds', 'window_seconds', 'duration_seconds']) {
+      if (hasOwn(window, key) && window[key] !== null && window[key] !== undefined && typeof window[key] !== 'boolean' && Number.isFinite(Number(window[key])) && Number(window[key]) > 0) {
+        return Number(window[key]);
+      }
+    }
+    return 0;
+  };
+
+  const personalCycleCostEstimate = () => null;
+  const isCodexAutoReviewModel = (name) => String(name || '').trim().toLowerCase() === 'codex-auto-review';
+  const isImageModel = (name) => { const m = String(name || '').trim().toLowerCase(); return m === 'gpt-image-2' || m === 'image2'; };
+  const getModelDisplayName = (item = {}) => String(item.model || item.model_id || item.model_name || item.name || item.id || 'unknown').trim();
+  const normalizeSpeed = (value, fallback = 'standard') => String(value || fallback).trim().toLowerCase();
+  const estimateModelUsd = (row = {}) => row?.estimatedUsd !== undefined ? row.estimatedUsd : null;
+  const formatModelCostCalculation = (row = {}) => {
+    if (row && typeof row.calculation === 'string' && row.calculation.trim()) {
+      return row.calculation;
+    }
+    return row?.estimatedUsd !== null && row?.estimatedUsd !== undefined ? `预估: ${fmtUsd(row.estimatedUsd)}` : '';
+  };
+
+  const tokenTotal = (obj = {}) => {
+    if (!obj || typeof obj !== 'object') return null;
+    if (hasOwn(obj, 'tokens')) {
+      if (obj.tokens === null || obj.tokens === undefined) return null;
+      const parsed = Number(obj.tokens);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    if (hasOwn(obj, 'text_total_tokens')) {
+      if (obj.text_total_tokens === null || obj.text_total_tokens === undefined) return null;
+      const parsed = Number(obj.text_total_tokens);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    const uncached = obj.uncachedInputTokens ?? obj.uncached_text_input_tokens;
+    const cached = obj.cachedInputTokens ?? obj.cached_text_input_tokens;
+    const output = obj.outputTokens ?? obj.output_tokens ?? obj.text_output_tokens;
+    const uNum = Number(uncached);
+    const cNum = Number(cached);
+    const oNum = Number(output);
+    if (Number.isFinite(uNum) && Number.isFinite(cNum) && Number.isFinite(oNum)) {
+      return uNum + cNum + oNum;
+    }
+    return null;
+  };
+
+  let snapshot = (typeof options.getSnapshot === 'function' ? options.getSnapshot() : null) || {};
+
+  const state = {
+    shadowRoot: shadow,
+    shadowEventsBound: false,
+    loading: false,
+    error: '',
+    accountMode: null,
+    viewMode: 'personal',
+    selectedStartDate: '',
+    selectedEndDate: '',
+    quotaWindow: null,
+    cycleStartMs: NaN,
+    cycleEndMs: NaN,
+    expandedDates: new Set(),
+  };
+
+  const syncStateFromSnapshot = () => {
+    state.loading = (snapshot.status === 'loading');
+    state.error = snapshot.error || '';
+    state.accountMode = snapshot.accountMode || null;
+    state.viewMode = snapshot.viewMode || 'personal';
+
+    const newStart = snapshot.range?.startDate || '';
+    const newEnd = snapshot.range?.endDate || '';
+    if (newStart !== state.selectedStartDate || newEnd !== state.selectedEndDate) {
+      dateInputDirty = false;
+      localStartDate = newStart;
+      localEndDate = newEnd;
+      state.selectedStartDate = newStart;
+      state.selectedEndDate = newEnd;
+    }
+
+    // ALWAYS reset cycle start/end to NaN before mapping every snapshot
+    state.cycleStartMs = NaN;
+    state.cycleEndMs = NaN;
+
+    if (snapshot.quota && typeof snapshot.quota === 'object') {
+      const q = snapshot.quota;
+      const isAvail = q.available !== false;
+      state.quotaWindow = {
+        _window_name: '配额窗口',
+        available: q.available,
+        duration_seconds: q.durationSeconds,
+        limit_window_seconds: q.durationSeconds,
+        usedRatio: isAvail && q.usedRatio !== undefined && q.usedRatio !== null ? q.usedRatio : null,
+        used_ratio: isAvail && q.usedRatio !== undefined && q.usedRatio !== null ? q.usedRatio : null,
+        remaining: isAvail && q.remaining !== undefined && q.remaining !== null && Number.isFinite(Number(q.remaining)) ? Number(q.remaining) : null,
+        limit: isAvail && q.limit !== undefined && q.limit !== null && Number.isFinite(Number(q.limit)) ? Number(q.limit) : null,
+        resetAt: q.resetAt || null,
+        reset_at: q.resetAt || null,
+        cycleStartDate: q.cycleStartDate || null,
+        cycleEndDate: q.cycleEndDate || null,
+      };
+
+      if (q.cycleStartDate) {
+        state.cycleStartMs = dayStartMs(q.cycleStartDate);
+      } else if (q.resetAt && q.durationSeconds) {
+        const resetMs = toEpochMs(q.resetAt);
+        if (Number.isFinite(resetMs)) {
+          state.cycleStartMs = resetMs - (q.durationSeconds * 1000);
+        }
+      }
+
+      if (q.cycleEndDate) {
+        state.cycleEndMs = dayStartMs(q.cycleEndDate);
+      } else if (q.resetAt) {
+        state.cycleEndMs = toEpochMs(q.resetAt);
+      }
     } else {
-      invokeLoad({
-        preset: 'cycle',
-        viewMode: vm
+      state.quotaWindow = null;
+    }
+  };
+
+  syncStateFromSnapshot();
+
+  const sanitizeSnapshotForDebug = (snap) => {
+    if (!snap || typeof snap !== 'object') return {};
+    const safe = {};
+    const allowed = [
+      'status', 'error', 'accountMode', 'viewMode', 'range',
+      'quota', 'summary', 'models', 'daily', 'clients',
+      'modelActivity', 'notices', 'updatedAt'
+    ];
+    for (const key of allowed) {
+      if (hasOwn(snap, key)) {
+        safe[key] = snap[key];
+      }
+    }
+    return safe;
+  };
+
+  const hasVisibleData = () => {
+    if (!snapshot) return false;
+    if (Array.isArray(snapshot.daily) && snapshot.daily.length > 0) return true;
+    if (Array.isArray(snapshot.models) && snapshot.models.length > 0) return true;
+    if (snapshot.summary && (snapshot.summary.tokens !== null || snapshot.summary.turns !== null || snapshot.summary.estimatedUsd !== null)) {
+      if (Number(snapshot.summary.tokens) >= 0 || Number(snapshot.summary.turns) >= 0 || Number(snapshot.summary.estimatedUsd) >= 0) return true;
+    }
+    return false;
+  };
+
+  const getVisibleData = () => {
+    const isTeamView = state.viewMode === 'team';
+
+    const modelRows = asArray(snapshot.models).map((m) => ({
+      name: m.name,
+      speed: m.speed || 'standard',
+      tokens: m.tokens !== undefined ? m.tokens : null,
+      uncachedInputTokens: m.uncachedInputTokens !== undefined ? m.uncachedInputTokens : null,
+      cachedInputTokens: m.cachedInputTokens !== undefined ? m.cachedInputTokens : null,
+      outputTokens: m.outputTokens !== undefined ? m.outputTokens : null,
+      estimatedUsd: m.estimatedUsd !== undefined ? m.estimatedUsd : null,
+      hasEstimatedAllocation: Boolean(m.estimatedAllocation),
+      hasRateFallback: Boolean(m.fallbackPricing),
+      usesFallbackPricing: Boolean(m.fallbackPricing),
+      hasImageFieldFallback: Boolean(m.incompleteImage),
+      calculation: m.calculation || null,
+    }));
+
+    const modelSummary = {
+      rows: modelRows,
+      hasEstimatedAllocation: modelRows.some((r) => r.hasEstimatedAllocation),
+      hasFallbackPricing: modelRows.some((r) => r.usesFallbackPricing),
+    };
+
+    const dailyBreakdown = asArray(snapshot.daily).map((d) => {
+      const dayModels = asArray(d.models).map((m) => ({
+        name: m.name,
+        model: m.name,
+        speed: m.speed || 'standard',
+        tokens: m.tokens !== undefined ? m.tokens : null,
+        uncachedInputTokens: m.uncachedInputTokens !== undefined ? m.uncachedInputTokens : null,
+        cachedInputTokens: m.cachedInputTokens !== undefined ? m.cachedInputTokens : null,
+        outputTokens: m.outputTokens !== undefined ? m.outputTokens : null,
+        estimatedUsd: m.estimatedUsd !== undefined ? m.estimatedUsd : null,
+        calculation: m.calculation || null,
+        hasEstimatedAllocation: Boolean(m.estimatedAllocation),
+        hasRateFallback: Boolean(m.fallbackPricing),
+        usesFallbackPricing: Boolean(m.fallbackPricing),
+        hasImageFieldFallback: Boolean(m.incompleteImage),
+      }));
+
+      const dateStr = d.date || '';
+      const sortTs = dayStartMs(dateStr) || 0;
+      const hasTeamTokenModels = dayModels.length > 0 && dayModels.some((m) => (m.tokens !== null && m.tokens !== undefined && Number.isFinite(Number(m.tokens))));
+
+      return {
+        _sortTs: sortTs,
+        _dateKey: dateStr,
+        _displayDate: dateStr,
+        _tokenModels: dayModels,
+        _hasTeamTokenModels: hasTeamTokenModels,
+        _estimatedUsd: d.estimatedUsd !== undefined ? d.estimatedUsd : null,
+        tokens: d.tokens !== undefined ? d.tokens : null,
+        uncachedInputTokens: d.uncachedInputTokens !== undefined ? d.uncachedInputTokens : null,
+        cachedInputTokens: d.cachedInputTokens !== undefined ? d.cachedInputTokens : null,
+        outputTokens: d.outputTokens !== undefined ? d.outputTokens : null,
+        turns: d.turns !== undefined ? d.turns : null,
+        threads: d.threads !== undefined ? d.threads : null,
+        credits: d.credits !== undefined ? d.credits : null,
+        totals: {
+          tokens: d.tokens !== undefined ? d.tokens : null,
+          turns: d.turns !== undefined ? d.turns : null,
+          threads: d.threads !== undefined ? d.threads : null,
+        },
+      };
+    });
+
+    const summary = {
+      tokens: snapshot.summary?.tokens !== undefined ? snapshot.summary.tokens : null,
+      uncachedInputTokens: snapshot.summary?.uncachedInputTokens !== undefined ? snapshot.summary.uncachedInputTokens : null,
+      cachedInputTokens: snapshot.summary?.cachedInputTokens !== undefined ? snapshot.summary.cachedInputTokens : null,
+      outputTokens: snapshot.summary?.outputTokens !== undefined ? snapshot.summary.outputTokens : null,
+      turns: snapshot.summary?.turns !== undefined ? snapshot.summary.turns : null,
+      threads: snapshot.summary?.threads !== undefined ? snapshot.summary.threads : null,
+      credits: snapshot.summary?.credits !== undefined ? snapshot.summary.credits : null,
+      estimatedUsd: snapshot.summary?.estimatedUsd !== undefined ? snapshot.summary.estimatedUsd : null,
+      activeMembersPeak: snapshot.summary?.activeMembersPeak !== undefined ? snapshot.summary.activeMembersPeak : null,
+      activeMemberDays: null,
+    };
+
+    const clientStats = asArray(snapshot.clients).map((c) => ({
+      name: c.name || '未知',
+      tokens: c.tokens !== undefined ? c.tokens : null,
+      turns: c.turns !== undefined ? c.turns : null,
+      credits: c.credits !== undefined ? c.credits : null,
+    }));
+
+    const teamModelActivity = asArray(snapshot.modelActivity).map((ma) => ({
+      name: ma.name,
+      turns: ma.turns !== undefined ? ma.turns : null,
+      threads: ma.threads !== undefined ? ma.threads : null,
+      credits: ma.credits !== undefined ? ma.credits : null,
+      activeMembersPeak: ma.activeMembersPeak !== undefined ? ma.activeMembersPeak : null,
+    }));
+
+    return {
+      generatedAt: snapshot.updatedAt || new Date().toISOString(),
+      accountMode: state.accountMode,
+      viewMode: state.viewMode,
+      selectedRange: snapshot.range || { startDate: '', endDate: '' },
+      quota: snapshot.quota,
+      summary,
+      currentUserSummary: isTeamView ? null : summary,
+      currentUserModelSummary: modelSummary,
+      teamModelSummary: isTeamView ? modelSummary : null,
+      teamModelActivity,
+      clientStats,
+      dailyBreakdown,
+    };
+  };
+
+  // Exact verbatim render routines
+  const renderQuotaCard = () => {
+    const window = state.quotaWindow;
+    const ratio = usedRatioFromWindow(window);
+    const percent = usedPercentTextFromWindow(window);
+    const className = ratio >= .85 ? 'danger' : ratio >= .6 ? 'warn' : 'ok';
+    const remaining = quotaValue(window, ['remaining', 'remaining_credits', 'available', 'available_credits']);
+    const hasUsedPercentOrRatio = ['used_ratio', 'usedRatio', 'fraction_used', 'used_percent', 'usedPercent']
+      .some((key) => hasNumericField(window, key));
+    const remainingText = remaining !== null
+      ? `剩余: <strong>${escapeHtml(fmtNum(remaining))}</strong>`
+      : hasUsedPercentOrRatio
+        ? `剩余约 <strong>${escapeHtml(formatPercentFromRatio(1 - ratio))}</strong>（配额比例）`
+        : '剩余配额比例: <strong>未知</strong>';
+    const reset = quotaValue(window, ['reset_at', 'resetAt', 'resets_at', 'end_at', 'window_end']);
+    const cycleEstimate = personalCycleCostEstimate();
+    const estimateCardsHtml = cycleEstimate
+      ? `
+        <div class="quota-estimate-cards">
+          <div class="quota-estimate-card">
+            <div class="estimate-card-label">预计完整周期额度 <span class="estimate-tag">估算</span></div>
+            <div class="estimate-card-value">${fmtUsd(cycleEstimate.fullCycleUsd)}</div>
+            <div class="estimate-card-hint">当前周期个人总配额预估</div>
+          </div>
+          <div class="quota-estimate-card remaining">
+            <div class="estimate-card-label">预计剩余额度 <span class="estimate-tag">估算</span></div>
+            <div class="estimate-card-value">${fmtUsd(cycleEstimate.remainingUsd)}</div>
+            <div class="estimate-card-hint">当前可用余额额度预估</div>
+          </div>
+        </div>`
+      : `
+        <div class="quota-estimate-unavailable">
+          <span>ℹ️ 预计完整周期额度暂不可用：需当前周期有效个人模型费用及配额使用比例；自定义日期区间不参与该估算。</span>
+        </div>`;
+    return `
+      <section class="quota-card">
+        <div class="card-top">
+          <div class="eyebrow-wrap">
+            <span class="quota-icon">⚡</span>
+            <span class="eyebrow">个人配额概览</span>
+          </div>
+          <span class="quota-name">${escapeHtml(window?._window_name || '配额窗口')} · ${escapeHtml(formatDuration(getWindowDurationSeconds(window)))}</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill ${className}" style="width:${Math.round(ratio * 1000) / 10}%"></div>
+        </div>
+        <div class="quota-stats">
+          <span class="quota-stat-item"><strong>${escapeHtml(percent)}</strong> 已使用</span>
+          <span class="quota-stat-divider">·</span>
+          <span class="quota-stat-item">${remainingText}</span>
+          <span class="quota-stat-divider">·</span>
+          <span class="quota-stat-item">重置时间: <strong>${escapeHtml(reset ? formatDateTime(toEpochMs(reset)) : '—')}</strong></span>
+        </div>
+        ${estimateCardsHtml}
+        <div class="quota-notice-box">
+          <span class="quota-notice-icon">💡</span>
+          <span>配额使用比例为实时更新，而用量费用数据存在延迟，因此估算并非完全准确。</span>
+        </div>
+      </section>`;
+  };
+  const renderViewQuota = (isTeamView) => isTeamView ? '' : renderQuotaCard();
+  const renderMiniBars = (modelStats) => {
+    if (!modelStats.rows.length) return '<div class="card-sub">暂无模型 Token 数据</div>';
+    const validUsdValues = modelStats.rows
+      .map((r) => r.estimatedUsd)
+      .filter((v) => v !== null && v !== undefined && Number.isFinite(Number(v)));
+    const max = validUsdValues.length ? Math.max(...validUsdValues, CONFIG.EPS) : 0;
+    return `
+      <div class="mini-bars" title="各模型预估费用占比">
+        ${modelStats.rows.slice(0, 3).map((row) => {
+          const hasVal = row.estimatedUsd !== null && row.estimatedUsd !== undefined && Number.isFinite(Number(row.estimatedUsd));
+          const pct = (hasVal && max > 0) ? Math.max(4, Math.min(100, (Number(row.estimatedUsd) / max) * 100)) : 0;
+          const costText = hasVal ? fmtUsd(row.estimatedUsd) : '不可用';
+          return `
+          <div class="mini-bar-item">
+            <span class="mini-bar-name" title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</span>
+            <div class="mini-bar" title="${escapeHtml(`${row.name}: ${costText}`)}">
+              <span style="width:${pct}%"></span>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>`;
+  };  const renderTokenCostKpis = (stats, modelStats, { isTeamView = false, currentUserSummary = null } = {}) => {
+    const tokenCard = `
+      <section class="summary-card">
+        <div class="card-header-row">
+          <span class="card-label">总 Token 数</span>
+          <span class="card-badge tokens">用量</span>
+        </div>
+        <div class="card-value" title="${escapeHtml(fmtFullNum(stats.tokens))}">${fmtNum(stats.tokens)}</div>
+        <div class="card-sub">
+          <div><span class="sub-dot uncached"></span>未缓存: <strong>${fmtNum(stats.uncachedInputTokens)}</strong></div>
+          <div><span class="sub-dot cached"></span>已缓存: <strong>${fmtNum(stats.cachedInputTokens)}</strong> · 输出: <strong>${fmtNum(stats.outputTokens)}</strong></div>
+        </div>
+      </section>`;
+    const costCard = `
+      <section class="summary-card">
+        <div class="card-header-row">
+          <span class="card-label">${isTeamView ? '团队预估费用' : '预估费用'}</span>
+          <span class="card-badge cost">预估</span>
+        </div>
+        <div class="card-value cost-value">${modelStats.rows.length ? fmtUsd(isTeamView ? stats.estimatedUsd : stats.estimatedUsd) : '不可用'}</div>
+        ${isTeamView ? `<div class="card-sub">工作区精确模型 Token 计价<br>当前用户对比 Token：<strong>${fmtNum(currentUserSummary?.tokens)}</strong></div>` : ''}
+        ${renderMiniBars(modelStats)}
+      </section>`;
+    return `<div class="kpi-grid-left">${isTeamView ? `${costCard}${tokenCard}` : `${tokenCard}${costCard}`}</div>`;
+  };
+  const renderActivityKpi = (stats, { isTeamView = false } = {}) => `
+    <div class="kpi-grid-right">
+      <section class="summary-card">
+        <div class="card-header-row">
+          <span class="card-label">交互活跃度</span>
+          <span class="card-badge activity">活跃</span>
+        </div>
+        <div class="card-value">${fmtTurns(stats.turns)} <span class="card-unit">轮</span></div>
+        <div class="card-sub">
+          <div>对话轮数: <strong>${fmtTurns(stats.turns)}</strong> 轮</div>
+          <div>主题数量: <strong>${fmtTurns(stats.threads)}</strong> 个${isTeamView && stats.activeMembersPeak ? ` · 日活成员峰值: <strong>${fmtNum(stats.activeMembersPeak)}</strong>` : ''}</div>
+        </div>
+      </section>
+    </div>`;
+  const modelColors = ['#7c3aed', '#2563eb', '#10b981', '#d97706', '#dc2626', '#0891b2'];
+  const renderModelTable = (modelStats, { isTeamView = false } = {}) => `
+    <section class="section">
+      <div class="section-title-row">
+        <div class="section-title">
+          <span class="section-icon">🧠</span>
+          <span>${isTeamView ? '团队 · 工作区精确 Token' : '模型用量明细'}</span>
+        </div>
+        <div class="section-note">${isTeamView ? '工作区分析精确 Token 行' : modelStats.hasEstimatedAllocation ? '费率折算分摊' : 'Token 接口'}</div>
+      </div>
+      ${modelStats.rows.length ? `<div class="table-box"><table>
+        <thead>
+          <tr>
+            <th>模型</th>
+            <th class="num-th">Token 总数</th>
+            <th class="num-th">未缓存输入</th>
+            <th class="num-th">已缓存输入</th>
+            <th class="num-th">输出</th>
+            <th class="num-th">预估费用</th>
+          </tr>
+        </thead>
+        <tbody>${modelStats.rows.map((row, index) => `
+          <tr class="model-row">
+            <td>
+              <div class="model-cell">
+                <span class="model-color-indicator" style="background:${modelColors[index % modelColors.length]}"></span>
+                <span class="model-pill" title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</span>
+                ${row.speed !== 'standard' ? `<span class="speed-pill">${escapeHtml(row.speed === 'fast' ? 'fast' : row.speed)}</span>` : ''}
+                ${row.hasEstimatedAllocation ? `<span class="estimate-pill" title="个人模式用量已根据额度占比与混合模型费率进行折算分摊。">${row.hasRateFallback ? '兜底估算' : '折算分摊'}</span>` : ''}
+              </div>
+            </td>
+            <td class="num" title="${escapeHtml(fmtFullNum(row.tokens))}">${fmtNum(row.tokens)}</td>
+            <td class="num">${fmtNum(row.uncachedInputTokens)}</td>
+            <td class="num">${fmtNum(row.cachedInputTokens)}</td>
+            <td class="num">${fmtNum(row.outputTokens)}</td>
+            <td class="money${row.usesFallbackPricing ? ' fallback' : ''}" title="${escapeHtml(formatModelCostCalculation(row))}">${fmtUsd(row.estimatedUsd)}${row.usesFallbackPricing ? '*' : ''}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<div class="empty">所选范围内未找到模型用量明细。</div>'}
+      ${modelStats.hasFallbackPricing ? '<div class="section-footnote">* 未知模型默认采用 GPT-5.5 费率进行估算。</div>' : ''}
+      ${modelStats.rows.some((row) => isCodexAutoReviewModel(row.name)) ? '<div class="section-footnote">codex-auto-review 按 gpt-5.6-luna 映射估算（用户指定，非官方独立价格）。</div>' : ''}
+      ${modelStats.rows.some((row) => isImageModel(row.name)) ? `<div class="section-footnote">gpt-image-2/image2 使用图像模态专用费率估算；${modelStats.rows.some((row) => row.hasImageFieldFallback) ? '按可用字段估算，缺少明确图像输出模态拆分时可能不完整。' : '已按返回的明确模态字段计费。'} 计费参考：<a href="${GPT_IMAGE_2_PRICING_URL}" target="_blank" rel="noreferrer">OpenAI API Pricing</a></div>` : ''}
+      ${isTeamView ? '<div class="section-footnote">无 Token 的模型活动行仅用于团队活动统计，不参与 Token 或费用计算。</div>' : ''}
+    </section>`;
+  const renderTeamOverview = (stats, modelActivity) => {
+    if (state.accountMode !== 'team' || state.viewMode !== 'team') return '';
+    return `
+      <section class="section">
+        <div class="section-title-row">
+          <div class="section-title">
+            <span class="section-icon">👥</span>
+            <span>团队汇总</span>
+          </div>
+        </div>
+        <div class="notice">团队总计: ${fmtNum(stats.tokens)} Token · ${fmtTurns(stats.turns)} 轮对话 · ${fmtTurns(stats.threads)} 个主题。每日活跃成员峰值: <strong>${fmtNum(stats.activeMembersPeak)}</strong>；累计活跃成员日: <strong>${fmtNum(stats.activeMemberDays)}</strong>（不是去重成员数）。接口不支持按成员展开。</div>
+        ${modelActivity.length ? `<div class="table-box"><table>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th class="num-th">对话轮数</th>
+              <th class="num-th">主题数</th>
+              <th class="num-th">日活成员峰值</th>
+            </tr>
+          </thead>
+          <tbody>${modelActivity.map((row) => `
+            <tr>
+              <td><span class="model-pill">${escapeHtml(row.name)}</span></td>
+              <td class="num">${fmtTurns(row.turns)}</td>
+              <td class="num">${fmtTurns(row.threads)}</td>
+              <td class="num">${fmtNum(row.activeMembersPeak)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table></div>` : '<div class="section-footnote">接口未返回可展示的模型活动行。</div>'}
+      </section>`;
+  };
+  const renderClientTable = (clients, { isTeamView = false } = {}) => `
+    <section class="section">
+      <div class="section-title-row">
+        <div class="section-title">
+          <span class="section-icon">💻</span>
+          <span>客户端用量明细</span>
+        </div>
+        <div class="section-note">${isTeamView ? '团队工作区分析数据' : '个人工作区分析数据'}</div>
+      </div>
+      ${clients.length ? `<div class="table-box"><table>
+        <thead>
+          <tr>
+            <th>客户端</th>
+            <th class="num-th">Token 数</th>
+            <th class="num-th">对话轮数</th>
+            <th class="num-th">额度 (Credits)</th>
+          </tr>
+        </thead>
+        <tbody>${clients.map((row) => `
+          <tr>
+            <td><span class="client-label" title="${escapeHtml(row.name)}">${escapeHtml(row.name)}</span></td>
+            <td class="num">${fmtNum(row.tokens)}</td>
+            <td class="num">${fmtTurns(row.turns)}</td>
+            <td class="num">${fmtNum(row.credits)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>` : '<div class="empty">所选范围内未查询到客户端数据。</div>'}
+    </section>`;
+  const renderDailyTable = (rows, stats, { isTeamView = false } = {}) => {
+    const sorted = [...rows].sort((a, b) => b._sortTs - a._sortTs);
+    return `
+      <section class="section">
+        <div class="section-title-row">
+          <div class="section-title">
+            <span class="section-icon">📅</span>
+            <span>每日明细</span>
+          </div>
+          <div class="section-note">点击日期展开模型明细 · 按时间倒序</div>
+        </div>
+        <div class="table-box"><table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th class="num-th">Token 数</th>
+              <th class="num-th">轮数</th>
+              <th class="num-th">主题数</th>
+              <th class="num-th">${isTeamView ? '费用' : '预估费用'}</th>
+            </tr>
+          </thead>
+          <tbody>${sorted.length ? sorted.map((row) => {
+            const totals = row.totals || row;
+            const open = state.expandedDates.has(row._dateKey);
+            const models = asArray(row._tokenModels);
+            return `
+              <tr class="daily-row ${open ? 'is-open' : ''}" data-action="toggle-day" data-date="${escapeHtml(row._dateKey)}" role="button" tabindex="0" aria-expanded="${open}">
+                <td>
+                  <div class="date-cell">
+                    <span class="expand-icon">${open ? '▼' : '▶'}</span>
+                    <span>${escapeHtml(row._displayDate)}</span>
+                  </div>
+                </td>
+                <td class="num" title="${escapeHtml(fmtFullNum(tokenTotal(totals)))}">${fmtNum(tokenTotal(totals))}</td>
+                <td class="num">${fmtTurns(totals.turns)}</td>
+                <td class="num">${fmtTurns(totals.threads)}</td>
+                <td class="money">${isTeamView && !row._hasTeamTokenModels ? '不可用' : fmtUsd(row._estimatedUsd)}</td>
+              </tr>
+              <tr class="details-row" data-role="day-details" ${open ? '' : 'hidden'}>
+                <td colspan="5">
+                  <div class="day-details">
+                    ${models.length ? models.map((model) => `
+                      <div class="day-model">
+                        <div class="day-model-header">
+                          <strong>${escapeHtml(getModelDisplayName(model))}</strong>
+                          <span class="speed-tag">${escapeHtml(normalizeSpeed(model.speed) === 'fast' ? 'fast' : '标准')}</span>
+                        </div>
+                        <div class="day-model-body">
+                          <span>${fmtNum(tokenTotal(model))} Token</span>
+                          <span class="money">${fmtUsd(estimateModelUsd(model))}</span>
+                        </div>
+                      </div>`).join('') : '<div class="empty">该日期暂无模型 Token 明细数据。</div>'}
+                  </div>
+                </td>
+              </tr>`;
+          }).join('') : '<tr><td colspan="5" class="empty">所选范围内无每日明细数据。</td></tr>'}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td><strong>合计</strong></td>
+              <td class="num"><strong>${fmtNum(stats.tokens)}</strong></td>
+              <td class="num"><strong>${fmtTurns(stats.turns)}</strong></td>
+              <td class="num"><strong>${fmtTurns(stats.threads)}</strong></td>
+              <td class="money"><strong>${isTeamView && !rows.some((row) => row._hasTeamTokenModels) ? '不可用' : fmtUsd(stats.estimatedUsd)}</strong></td>
+            </tr>
+          </tfoot>
+        </table></div>
+      </section>`;
+  };
+  const renderLoading = () => `
+    <div class="loading-wrap">
+      <div class="two-column-layout skeleton-layout">
+        <div class="column-left">
+          <div class="kpi-grid-left">
+            <div class="skeleton card-sk"></div>
+            <div class="skeleton card-sk"></div>
+          </div>
+          <div class="skeleton table-sk-lg"></div>
+        </div>
+        <div class="column-right">
+          <div class="skeleton quota-sk"></div>
+          <div class="skeleton table-sk-lg"></div>
+        </div>
+      </div>
+      <div class="loading-text" role="status" aria-live="polite">
+        <span class="spinner"></span>
+        <span>正在加载配额、用量及模型数据...</span>
+      </div>
+    </div>`;
+  const renderContent = () => {
+    const visible = getVisibleData();
+    const isTeamView = visible.viewMode === 'team';
+    const modelStats = isTeamView
+      ? visible.teamModelSummary
+      : visible.currentUserModelSummary;
+    const allocationNotice = visible.viewMode === 'personal' && modelStats.hasEstimatedAllocation
+      ? '<div class="notice">💡 个人模式下的模型 Token 系根据每日总额及额度占比与模型费率折算，仅供参考，非实际计费账单。</div>'
+      : isTeamView
+        ? '<div class="notice">💡 团队 Token、模型和费用均来自工作区分析中的精确 Token 行；无 Token 的模型活动行仅用于轮数、主题和活跃成员统计，不参与计价。费用按配置价格估算，并非实际账单。</div>'
+        : '';
+    const controllerNoticesHtml = asArray(snapshot?.notices).map((msg) => `<div class="notice">💡 ${escapeHtml(msg)}</div>`).join('');
+    const allNotices = [allocationNotice, controllerNoticesHtml].filter(Boolean).join('');
+    const quotaHtml = renderViewQuota(isTeamView);
+    const tokenCostKpiHtml = renderTokenCostKpis(visible.summary, modelStats, { isTeamView, currentUserSummary: visible.currentUserSummary });
+    const activityKpiHtml = isTeamView ? renderActivityKpi(visible.summary, { isTeamView: true }) : '';
+    const teamOverviewHtml = isTeamView ? renderTeamOverview(visible.summary, visible.teamModelActivity) : '';
+    const clientTableHtml = isTeamView ? renderClientTable(visible.clientStats, { isTeamView: true }) : '';
+    const modelTableHtml = renderModelTable(modelStats, { isTeamView });
+    const dailyTableHtml = renderDailyTable(visible.dailyBreakdown, visible.summary, { isTeamView });
+
+    // Academic Paper-style Two-Column Layout:
+    // Personal View:
+    //   Left column: Token + Cost KPI -> Allocation Notice (if any) -> Model Breakdown Table
+    //   Right column: Quota Overview Card -> Daily Breakdown Table
+    // Team View:
+    //   Left column: Token + Cost KPI -> Team Notice (if any) -> Team Overview Table -> Model Breakdown Table
+    //   Right column: Activity KPI -> Client Breakdown Table -> Daily Breakdown Table
+    if (isTeamView) {
+      return `
+        <div class="two-column-layout">
+          <div class="column-left">
+            ${tokenCostKpiHtml}
+            ${allNotices ? `<div class="notice-wrap">${allNotices}</div>` : ''}
+            ${teamOverviewHtml}
+            ${modelTableHtml}
+          </div>
+          <div class="column-right">
+            ${activityKpiHtml}
+            ${clientTableHtml}
+            ${dailyTableHtml}
+          </div>
+        </div>`;
+    }
+
+    return `
+      <div class="two-column-layout">
+        <div class="column-left">
+          ${tokenCostKpiHtml}
+          ${allNotices ? `<div class="notice-wrap">${allNotices}</div>` : ''}
+          ${modelTableHtml}
+        </div>
+        <div class="column-right">
+          ${quotaHtml}
+          ${dailyTableHtml}
+        </div>
+      </div>`;
+  };
+
+
+  const renderPanelShell = () => {
+    const shadowRoot = createHostAndShadow();
+    if (shadowRoot.getElementById('modalCard')) return;
+    shadowRoot.innerHTML = `
+      <style>
+${css}
+        :host(.dark) {
+          --bg-backdrop: rgba(0, 0, 0, 0.72);
+          --bg-modal: #1e1e24;
+          --bg-header: #22222a;
+          --bg-subtle: #17171c;
+          --bg-card: #23232b;
+          --bg-card-hover: #2b2b35;
+          --bg-input: #17171c;
+          --bg-table-header: #1b1b22;
+          --bg-table-row-hover: #272732;
+          --bg-table-zebra: #202028;
+          --bg-table-footer: #1b1b22;
+          --bg-details: #18181f;
+          --bg-details-card: #23232b;
+          --bg-tag: #2a2a34;
+          --bg-pre: #141418;
+
+          --border: #33333f;
+          --border-subtle: #282832;
+          --border-strong: #4a4a58;
+          --border-focus: #10a37f;
+
+          --text-primary: #f1f5f9;
+          --text-secondary: #cbd5e1;
+          --text-muted: #8892a4;
+          --text-inverse: #0f172a;
+
+          --brand-green: #10a37f;
+          --brand-green-hover: #1ab890;
+          --brand-green-active: #0d8c6d;
+          --brand-green-subtle: rgba(16, 163, 127, 0.16);
+          --brand-green-border: rgba(16, 163, 127, 0.42);
+          --brand-green-text: #34d399;
+
+          --accent-blue: #3b82f6;
+          --accent-blue-subtle: rgba(59, 130, 246, 0.16);
+          --accent-blue-border: rgba(59, 130, 246, 0.42);
+          --accent-blue-text: #93c5fd;
+
+          --accent-purple: #a78bfa;
+          --accent-purple-subtle: rgba(167, 139, 250, 0.16);
+          --accent-purple-border: rgba(167, 139, 250, 0.42);
+          --accent-purple-text: #c4b5fd;
+
+          --accent-emerald: #34d399;
+          --accent-emerald-subtle: rgba(52, 211, 153, 0.15);
+
+          --accent-amber: #fbbf24;
+          --accent-amber-subtle: rgba(251, 191, 36, 0.16);
+          --accent-amber-border: rgba(251, 191, 36, 0.42);
+          --accent-amber-text: #fde68a;
+
+          --accent-red: #f87171;
+          --accent-red-subtle: rgba(248, 113, 113, 0.16);
+          --accent-red-border: rgba(248, 113, 113, 0.42);
+          --accent-red-text: #fca5a5;
+
+          --track-bg: #141418;
+          --scrollbar-thumb: #3e3e4e;
+          --scrollbar-thumb-hover: #58586c;
+
+          --shadow-modal: 0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.08);
+          --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.35), 0 1px 2px -1px rgba(0, 0, 0, 0.25);
+        }
+        :host(.dark) input[type='date'] {
+          color-scheme: dark;
+        }
+        :host(.dark) .skeleton {
+          background: linear-gradient(90deg, #23232b 25%, #2d2d38 37%, #23232b 63%);
+          background-size: 400% 100%;
+          border-color: var(--border);
+        }
+      </style>
+      <div class="modal-backdrop" id="modalBackdrop">
+        <main class="panel modal-card" id="modalCard" role="dialog" aria-modal="true" aria-labelledby="modalTitle" tabindex="-1">
+          <header class="header">
+            <div class="header-left">
+              <div class="header-title">
+                <span class="header-icon">📊</span>
+                <span class="title-text" id="modalTitle">Codex 用量追踪</span>
+                <span class="version">2026.08.27-v1</span>
+                <span class="mode-badge" id="modeBadge"></span>
+              </div>
+              <div class="header-delay-pill" title="OpenAI 用量数据统计非实时，一般约有数小时延迟">
+                <span class="delay-dot"></span>
+                <span class="delay-text">用量数据可能有延迟，并非实时更新</span>
+              </div>
+            </div>
+            <button class="close-btn" id="closeBtn" title="关闭 (ESC)" aria-label="关闭">✕</button>
+          </header>
+          <div class="range-bar">
+            <div class="date-fields">
+              <div class="field-group">
+                <label for="startDate">开始日期</label>
+                <input id="startDate" type="date">
+              </div>
+              <div class="field-group">
+                <label for="endDate">结束日期</label>
+                <input id="endDate" type="date">
+              </div>
+              <button class="primary-btn" id="loadBtn"></button>
+            </div>
+            <div class="presets-row">
+              <div class="presets">
+                <span class="preset-label">快捷:</span>
+                <button class="mini-btn" id="cycleBtn">本周期</button>
+                <button class="mini-btn" id="sevenBtn">近 7 天</button>
+                <button class="mini-btn" id="thirtyBtn">近 30 天</button>
+              </div>
+              <div class="view-switch" role="group" aria-label="数据视图切换">
+                <button class="view-switch-btn" id="personalViewBtn">个人</button>
+                <button class="view-switch-btn" id="teamViewBtn">团队</button>
+              </div>
+              <div class="cycle-hint" id="cycleHint"></div>
+            </div>
+          </div>
+          <div class="panel-body" id="panelBody">
+            <div id="panelError"></div>
+            <div id="panelContent"></div>
+            <div class="content-loading-overlay" id="contentLoadingOverlay" hidden aria-hidden="true" aria-busy="false" role="status">
+              <div class="loading-progress-line"></div>
+              <div class="content-loading-status"><span class="spinner"></span><span>正在更新数据...</span></div>
+            </div>
+            <footer class="footer">
+              <div class="export-group">
+                <button class="footer-btn" id="csvBtn">📥 导出 CSV</button>
+                <button class="footer-btn" id="jsonBtn">📥 导出 JSON</button>
+              </div>
+              <button class="footer-btn refresh" id="refreshBtn">🔄 刷新数据</button>
+              <details class="raw-json">
+                <summary>当前汇总数据</summary>
+                <pre id="rawJson"></pre>
+              </details>
+            </footer>
+          </div>
+        </main>
+      </div>`;
+    bindShadowEvents();
+  };
+
+  const syncContentLoadingOverlay = (overlay, isLoading, hasData) => {
+    if (!overlay) return;
+    const visible = Boolean(isLoading && hasData);
+    overlay.hidden = !visible;
+    overlay.classList.toggle('is-visible', visible);
+    overlay.setAttribute('aria-hidden', String(!visible));
+    overlay.setAttribute('aria-busy', String(visible));
+  };
+
+  const updatePanel = ({ replaceContent = true } = {}) => {
+    renderPanelShell();
+    const shadowRoot = state.shadowRoot;
+    const mode = state.accountMode === 'team'
+      ? (state.viewMode === 'team' ? '团队视图' : '个人视图')
+      : state.accountMode === 'personal' ? '个人模式' : (snapshot.status === 'loading' ? '加载中...' : '未知');
+    const isPersonalConfirmed = state.accountMode === 'personal';
+    const hasData = hasVisibleData();
+    const cycleHint = Number.isFinite(state.cycleStartMs)
+      ? `当前周期: ${dateKeyFromMs(state.cycleStartMs)} 至 ${dateKeyFromMs(Math.min(Date.now(), state.cycleEndMs))}`
+      : '周期日期将随配额用量自动加载。';
+    const byId = (id) => shadowRoot.getElementById(id);
+    const panelBody = byId('panelBody');
+    const scrollTop = panelBody?.scrollTop || 0;
+    const setDisabled = (id, disabled) => { const element = byId(id); if (element) element.disabled = disabled; };
+    const modeBadge = byId('modeBadge');
+    if (modeBadge) {
+      modeBadge.textContent = mode;
+      modeBadge.classList.toggle('personal', state.accountMode === 'personal');
+    }
+    const startInput = byId('startDate');
+    const endInput = byId('endDate');
+    if (startInput && shadowRoot.activeElement !== startInput) {
+      if (!dateInputDirty) {
+        startInput.value = state.selectedStartDate || '';
+        localStartDate = state.selectedStartDate || '';
+      } else {
+        startInput.value = localStartDate;
+      }
+    }
+    if (endInput && shadowRoot.activeElement !== endInput) {
+      if (!dateInputDirty) {
+        endInput.value = state.selectedEndDate || '';
+        localEndDate = state.selectedEndDate || '';
+      } else {
+        endInput.value = localEndDate;
+      }
+    }
+    const loadButton = byId('loadBtn');
+    if (loadButton) loadButton.innerHTML = state.loading ? '<span class="btn-spinner"></span>查询中...' : '查询';
+    const refreshButton = byId('refreshBtn');
+    if (refreshButton) refreshButton.innerHTML = state.loading ? '<span class="btn-spinner"></span>更新中...' : '🔄 刷新数据';
+    ['loadBtn', 'cycleBtn', 'sevenBtn', 'thirtyBtn', 'personalViewBtn', 'refreshBtn'].forEach((id) => setDisabled(id, state.loading));
+    setDisabled('teamViewBtn', state.loading || isPersonalConfirmed);
+    const personalButton = byId('personalViewBtn');
+    const teamButton = byId('teamViewBtn');
+    personalButton?.classList.toggle('active', state.viewMode === 'personal');
+    teamButton?.classList.toggle('active', state.viewMode === 'team');
+    if (teamButton) teamButton.title = isPersonalConfirmed ? '当前账号为个人账号，不支持团队视图' : '查看工作区团队汇总';
+    const hint = byId('cycleHint');
+    if (hint) hint.textContent = cycleHint;
+    const error = byId('panelError');
+    if (error) {
+      error.innerHTML = state.error
+        ? `<div class="error-banner" role="alert"><span class="error-icon">⚠️</span><div class="error-body"><div class="error-title">请求失败</div><div class="error-text">${escapeHtml(state.error)}</div></div></div>`
+        : '';
+    }
+    if (replaceContent) {
+      const content = byId('panelContent');
+      if (content) content.innerHTML = hasData ? renderContent() : state.loading ? renderLoading() : '<div class="empty-state"><div class="empty-icon">📈</div><div class="empty-title">暂无数据</div><div class="empty-desc">请选择日期范围后点击查询获取用量明细</div></div>';
+    }
+    syncContentLoadingOverlay(byId('contentLoadingOverlay'), state.loading, hasData);
+    ['csvBtn', 'jsonBtn'].forEach((id) => setDisabled(id, state.loading || !hasData));
+    const raw = byId('rawJson');
+    if (raw) raw.textContent = JSON.stringify(sanitizeSnapshotForDebug(snapshot), null, 2);
+    if (panelBody && replaceContent) {
+      panelBody.scrollTop = scrollTop;
+      safeRequestAnimationFrame(() => {
+        if (!destroyed && isModalOpen && panelBody) {
+          panelBody.scrollTop = scrollTop;
+        }
       });
     }
+  };
+
+  const toggleDailyDetails = (row) => {
+    const date = row?.getAttribute('data-date');
+    if (!date) return;
+    const panelBody = row.closest('.panel-body');
+    const scrollTop = panelBody?.scrollTop;
+    const detailsRow = row.nextElementSibling;
+    const isOpen = state.expandedDates.has(date);
+    if (isOpen) state.expandedDates.delete(date);
+    else state.expandedDates.add(date);
+    row.classList.toggle('is-open', !isOpen);
+    row.setAttribute('aria-expanded', String(!isOpen));
+    const icon = row.querySelector('.expand-icon');
+    if (icon) icon.textContent = isOpen ? '▶' : '▼';
+    if (detailsRow?.matches('[data-role="day-details"]')) detailsRow.hidden = isOpen;
+    if (panelBody && Number.isFinite(scrollTop)) {
+      panelBody.scrollTop = scrollTop;
+      safeRequestAnimationFrame(() => {
+        if (!destroyed && isModalOpen && panelBody) {
+          panelBody.scrollTop = scrollTop;
+        }
+      });
+    }
+  };
+
+  const bindShadowEvents = () => {
+    const shadowRoot = state.shadowRoot;
+    if (!shadowRoot || state.shadowEventsBound) return;
+    state.shadowEventsBound = true;
+    const byId = (id) => shadowRoot.getElementById(id);
+
+    shadowRoot.addEventListener('input', (e) => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      if (target.id === 'startDate') {
+        localStartDate = target.value;
+        dateInputDirty = true;
+      } else if (target.id === 'endDate') {
+        localEndDate = target.value;
+        dateInputDirty = true;
+      }
+    });
+
+    shadowRoot.addEventListener('click', (e) => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (!target) return;
+      const dailyRow = target.closest('[data-action="toggle-day"]');
+      if (dailyRow) {
+        toggleDailyDetails(dailyRow);
+        return;
+      }
+      if (target.closest('#closeBtn')) {
+        closeModal(true);
+        return;
+      }
+      if (e.target === byId('modalBackdrop')) {
+        closeModal(true);
+        return;
+      }
+      if (target.closest('#personalViewBtn')) {
+        if (state.viewMode !== 'personal') {
+          state.expandedDates.clear();
+          invokeSetView('personal');
+        }
+        return;
+      }
+      if (target.closest('#teamViewBtn')) {
+        if (state.accountMode === 'personal') return;
+        if (state.viewMode !== 'team') {
+          state.expandedDates.clear();
+          invokeSetView('team');
+        }
+        return;
+      }
+      if (target.closest('#loadBtn')) {
+        const startVal = byId('startDate')?.value;
+        const endVal = byId('endDate')?.value;
+        try {
+          validateRange(startVal, endVal);
+          dateInputDirty = false;
+          localStartDate = startVal;
+          localEndDate = endVal;
+          state.error = '';
+          invokeLoad({ startDate: startVal, endDate: endVal });
+        } catch (err) {
+          state.error = err.message || String(err);
+          updatePanel();
+        }
+        return;
+      }
+      if (target.closest('#cycleBtn')) {
+        dateInputDirty = false;
+        state.error = '';
+        invokeLoad({ preset: 'cycle' });
+        return;
+      }
+      if (target.closest('#sevenBtn')) {
+        dateInputDirty = false;
+        state.error = '';
+        invokeLoad({ preset: '7d' });
+        return;
+      }
+      if (target.closest('#thirtyBtn')) {
+        dateInputDirty = false;
+        state.error = '';
+        invokeLoad({ preset: '30d' });
+        return;
+      }
+      if (target.closest('#refreshBtn')) {
+        dateInputDirty = false;
+        state.error = '';
+        if (state.selectedStartDate && state.selectedEndDate) {
+          invokeLoad({ startDate: state.selectedStartDate, endDate: state.selectedEndDate });
+        } else {
+          invokeLoad({ preset: 'cycle' });
+        }
+        return;
+      }
+      if (target.closest('#csvBtn')) {
+        triggerDownload('csv');
+        return;
+      }
+      if (target.closest('#jsonBtn')) {
+        triggerDownload('json');
+        return;
+      }
+    });
+
+    shadowRoot.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeModal(true);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === ' ') {
+        const target = e.target instanceof Element ? e.target : null;
+        const dailyRow = target?.closest('[data-action="toggle-day"]');
+        if (dailyRow) {
+          e.preventDefault();
+          toggleDailyDetails(dailyRow);
+          return;
+        }
+      }
+      if (e.key === 'Tab') {
+        const modalCard = byId('modalCard');
+        if (!modalCard) return;
+        const focusable = modalCard.querySelectorAll('button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])');
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (e.shiftKey && (shadowRoot.activeElement === first || document.activeElement === first)) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && (shadowRoot.activeElement === last || document.activeElement === last)) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    });
+  };
+
+  function normalizeLoadParams(rawParams = {}) {
+    const viewMode = state.viewMode || snapshot.viewMode || 'personal';
+    if (rawParams.preset === '7d' || rawParams.preset === '30d' || rawParams.preset === 'cycle') {
+      return { preset: rawParams.preset, viewMode };
+    }
+    if (rawParams.startDate && rawParams.endDate && !rawParams.cycleDefault) {
+      return { startDate: rawParams.startDate, endDate: rawParams.endDate, viewMode };
+    }
+    return { preset: 'cycle', viewMode };
   }
 
-  btnRefresh.addEventListener('click', handleRetryOrRefresh);
+  function invokeLoad(rawParams) {
+    if (destroyed || !isModalOpen) return Promise.resolve(null);
+    const gen = modalGeneration;
+    const params = normalizeLoadParams(rawParams);
+    state.loading = true;
+    state.error = '';
+    updatePanel({ replaceContent: false });
+    return Promise.resolve()
+      .then(() => {
+        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
+        if (typeof options.onLoad !== 'function') return null;
+        return options.onLoad(params);
+      })
+      .catch((err) => {
+        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
+        state.loading = false;
+        state.error = (err && err.message) || '操作失败，请稍后重试';
+        updatePanel();
+        return null;
+      });
+  }
+
+  function invokeSetView(mode) {
+    if (destroyed || !isModalOpen) return Promise.resolve(null);
+    const gen = modalGeneration;
+    state.loading = true;
+    state.error = '';
+    // Awaits controller updates, preserve previous visible mode while loading
+    updatePanel({ replaceContent: false });
+    return Promise.resolve()
+      .then(() => {
+        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
+        if (typeof options.onSetView !== 'function') return null;
+        return options.onSetView(mode);
+      })
+      .catch((err) => {
+        if (destroyed || !isModalOpen || modalGeneration !== gen) return null;
+        state.loading = false;
+        state.error = (err && err.message) || '操作失败，请稍后重试';
+        updatePanel();
+        return null;
+      });
+  }
 
   function triggerDownload(format) {
     if (destroyed || typeof options.onExport !== 'function') return;
-    if (snapshot.status === 'loading') return;
+    if (state.loading) return;
     Promise.resolve()
       .then(() => options.onExport(format))
       .then((res) => {
         if (destroyed || !res || !res.text) return;
-        const blob = new Blob([res.text], { type: res.mime || 'text/plain;charset=utf-8' });
+        const blob = new Blob([res.text], { type: res.mime || (format === 'json' ? 'application/json;charset=utf-8' : 'text/csv;charset=utf-8') });
         const url = URL.createObjectURL(blob);
         activeObjectUrls.add(url);
         const a = document.createElement('a');
         a.href = url;
-        a.download = res.filename || ('team-usage.' + format);
+        a.download = res.filename || (`team-usage.${format}`);
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -3706,500 +6364,81 @@ function mountTeamUsagePanel(options) {
       })
       .catch(() => {
         if (destroyed) return;
-        genericErrorMessage = '导出数据失败，请重试';
-        if (isModalOpen) renderModalContent();
+        state.error = '导出数据失败，请重试';
+        updatePanel();
       });
   }
 
-  btnExportCsv.addEventListener('click', () => triggerDownload('csv'));
-  btnExportJson.addEventListener('click', () => triggerDownload('json'));
-
-  btnClose.addEventListener('click', () => closeModal(true));
-  btnCloseBottom.addEventListener('click', () => closeModal(true));
-
-  // Close when clicking outside on backdrop or pressing escape/cancel
-  backdropEl.addEventListener('pointerdown', (e) => {
-    if (e.target === backdropEl) {
-      closeModal(true);
-    }
-  });
-
-  backdropEl.addEventListener('cancel', (e) => {
-    e.preventDefault();
-    closeModal(true);
-  });
-
-  backdropEl.addEventListener('close', () => {
-    if (isModalOpen) {
-      closeModal(false);
-    }
-  });
-
-  dialogEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      closeModal(true);
-    }
-  });
-
-  // Modal open & close
   function openModal() {
     if (destroyed || isModalOpen) return;
+    modalGeneration++;
 
-    // Refresh latest snapshot from getter before setting isModalOpen
+    // Read latest snapshot & bind account/data BEFORE setting isModalOpen & showPanelHost
     if (typeof options.getSnapshot === 'function') {
       try {
         const latest = options.getSnapshot();
         if (latest && typeof latest === 'object') {
           snapshot = latest;
-          if (latest.accountId !== undefined) {
-            currentActiveAccount = latest.accountId;
-          }
+          syncStateFromSnapshot();
         }
       } catch (_) {}
     }
 
-    if (destroyed || isModalOpen) return;
-
-    modalGeneration++;
     isModalOpen = true;
-    syncTheme();
-
-    try {
-      if (typeof backdropEl.showModal === 'function') {
-        if (!backdropEl.open) backdropEl.showModal();
-      } else {
-        backdropEl.setAttribute('open', '');
-      }
-    } catch (_) {
-      backdropEl.setAttribute('open', '');
-    }
-
-    // Check if initial fetch needed
-    if (!snapshot || snapshot.status === 'idle') {
-      invokeLoad({ preset: 'cycle', viewMode: (snapshot && snapshot.viewMode) || 'personal' });
-    }
-
-    renderModalContent();
+    showPanelHost();
+    updatePanel();
 
     safeRequestAnimationFrame(() => {
-      try { btnClose.focus(); } catch (_) {}
+      const closeBtn = state.shadowRoot?.getElementById('closeBtn');
+      if (closeBtn && typeof closeBtn.focus === 'function') {
+        closeBtn.focus();
+      }
     });
+
+    // If status is idle, always load cycle explicitly on open (ready cache allowed)
+    if (snapshot.status === 'idle') {
+      invokeLoad({ preset: 'cycle' });
+    }
   }
 
-  function closeModal(restoreFocus = false) {
+  function closeModal(userInitiated = false) {
     if (!isModalOpen) return;
-    modalGeneration++;
     isModalOpen = false;
+    modalGeneration++;
+    hidePanel();
 
-    try {
-      if (typeof backdropEl.close === 'function') {
-        if (backdropEl.open) backdropEl.close();
-      } else {
-        backdropEl.removeAttribute('open');
-      }
-    } catch (_) {
-      backdropEl.removeAttribute('open');
+    // Any close cancels current in-flight
+    if (typeof options.onCancel === 'function' && state.loading) {
+      try { options.onCancel(); } catch (_) {}
+    }
+    state.loading = false;
+
+    // Refresh state from fresh snapshot if available
+    if (typeof options.getSnapshot === 'function') {
+      try {
+        const fresh = options.getSnapshot();
+        if (fresh && typeof fresh === 'object') {
+          snapshot = fresh;
+          syncStateFromSnapshot();
+        }
+      } catch (_) {}
     }
 
-    if (snapshot && snapshot.status === 'loading') {
-      safeInvoke(options.onCancel);
-    }
-
-    if (restoreFocus && lastFocusedTrigger) {
-      const trigger = lastFocusedTrigger;
-      lastFocusedTrigger = null;
-      safeRequestAnimationFrame(() => {
-        try {
-          if (typeof trigger.focus === 'function' && document.contains(trigger)) {
-            trigger.focus();
-          }
-        } catch (_) {}
-      });
-    } else {
-      lastFocusedTrigger = null;
+    // Only restore profile focus on USER intent
+    if (userInitiated && lastFocusedTrigger && typeof lastFocusedTrigger.focus === 'function') {
+      try { lastFocusedTrigger.focus(); } catch (_) {}
     }
   }
 
-  // Render Body Content (preserves scroll position and date input focus)
-  function renderModalContent() {
-    const isLoading = snapshot.status === 'loading';
-    loadingBarWrap.style.display = isLoading ? 'block' : 'none';
-
-    // Update Header buttons state
-    const isPersonalMode = (snapshot.viewMode || 'personal') === 'personal';
-    btnViewPersonal.classList.toggle('active', isPersonalMode);
-    btnViewPersonal.setAttribute('aria-pressed', isPersonalMode ? 'true' : 'false');
-    btnViewTeam.classList.toggle('active', !isPersonalMode);
-    btnViewTeam.setAttribute('aria-pressed', !isPersonalMode ? 'true' : 'false');
-
-    // Disable controls while loading
-    btnViewPersonal.disabled = isLoading;
-    btnViewTeam.disabled = (snapshot.accountMode === 'personal') || isLoading;
-    btnViewTeam.title = snapshot.accountMode === 'personal' ? '当前非团队工作空间' : '';
-
-    btnPresetCycle.disabled = isLoading;
-    btnPreset7d.disabled = isLoading;
-    btnPreset30d.disabled = isLoading;
-    inputStartDate.disabled = isLoading;
-    inputEndDate.disabled = isLoading;
-    btnApplyDates.disabled = isLoading;
-    btnRefresh.disabled = isLoading;
-
-    const hasData = (Array.isArray(snapshot.models) && snapshot.models.length > 0) ||
-      (Array.isArray(snapshot.daily) && snapshot.daily.length > 0) ||
-      (snapshot.summary && (snapshot.summary.tokens !== null && snapshot.summary.tokens !== undefined && Number.isFinite(Number(snapshot.summary.tokens))));
-    const isExportReady = !isLoading && snapshot.status !== 'error' && snapshot.status !== 'idle' && hasData;
-
-    btnExportCsv.disabled = !isExportReady;
-    btnExportJson.disabled = !isExportReady;
-
-    // Footer update time (always updates)
-    if (snapshot.updatedAt) {
-      footerStatusText.textContent = '数据更新于 ' + formatDateTime(snapshot.updatedAt) + ' · 数据可能有延迟';
-    } else {
-      footerStatusText.textContent = '按参考费率估算，非实际账单 · 数据可能有延迟';
+  function handleWindowKeyDown(e) {
+    if (isModalOpen && e.key === 'Escape') {
+      e.preventDefault();
+      closeModal(true);
     }
-
-    // Preserve unsent date edits
-    const activeEl = shadow.activeElement;
-    if (!dateInputDirty && activeEl !== inputStartDate && activeEl !== inputEndDate) {
-      if (snapshot.range && snapshot.range.startDate) {
-        inputStartDate.value = localStartDate = formatDate(snapshot.range.startDate);
-        inputEndDate.value = localEndDate = formatDate(snapshot.range.endDate || '');
-      } else if (!localStartDate) {
-        inputStartDate.value = localStartDate = getUtcDateStr(6);
-        inputEndDate.value = localEndDate = getUtcDateStr(0);
-      }
-    }
-
-    // Check body cache signature to avoid rebuilding DOM on status-only / unchanged updates
-    const displayError = snapshot.error || genericErrorMessage;
-    const currentSig = JSON.stringify({
-      status: snapshot.status === 'error' ? 'error' : 'normal',
-      error: displayError || null,
-      accountId: snapshot.accountId || null,
-      viewMode: snapshot.viewMode || 'personal',
-      range: snapshot.range || null,
-      quota: snapshot.quota || null,
-      summary: snapshot.summary || null,
-      models: snapshot.models || [],
-      daily: snapshot.daily || [],
-      clients: snapshot.clients || [],
-      modelActivity: snapshot.modelActivity || [],
-      notices: snapshot.notices || []
-    });
-
-    if (lastRenderedSignature === currentSig) {
-      return;
-    }
-
-    // Preserve scroll position if same account and range
-    const sameAccountAndRange = (lastRenderedAccount === snapshot.accountId) &&
-      (JSON.stringify(lastRenderedRange) === JSON.stringify(snapshot.range));
-    const scrollPos = sameAccountAndRange ? modalBodyEl.scrollTop : 0;
-
-    // Prune expanded dates not in current daily list
-    const currentDailyDates = new Set();
-    if (Array.isArray(snapshot.daily)) {
-      snapshot.daily.forEach((d) => {
-        if (d && d.date) currentDailyDates.add(formatDate(d.date));
-      });
-    }
-    expandedDates.forEach((d) => {
-      if (!currentDailyDates.has(d)) expandedDates.delete(d);
-    });
-
-    modalBodyEl.textContent = '';
-
-    // Error banner
-    if (snapshot.status === 'error' || displayError) {
-      const errBox = el('div', 'error-banner', null, modalBodyEl);
-      el('span', null, '获取额度用量数据失败: ' + (displayError || '网络或接口异常'), errBox);
-      const btnRetry = el('button', 'btn-preset', '重试', errBox, { type: 'button' });
-      btnRetry.disabled = isLoading;
-      btnRetry.addEventListener('click', handleRetryOrRefresh);
-    }
-
-    // Personal Quota Section (if available)
-    const quota = snapshot.quota;
-    if (quota && quota.available && isPersonalMode) {
-      el('div', 'section-title', '个人配额使用状态', modalBodyEl);
-      const quotaGrid = el('div', 'kpi-grid', null, modalBodyEl);
-
-      // Used Ratio Card
-      const cardUsed = el('div', 'kpi-card', null, quotaGrid);
-      el('div', 'kpi-label', '已用额度比例', cardUsed);
-      const hasRatio = quota.usedRatio !== null && quota.usedRatio !== undefined && Number.isFinite(Number(quota.usedRatio));
-      const ratioText = hasRatio
-        ? (Number(quota.usedRatio) * 100).toFixed(1) + '%'
-        : '—';
-      el('div', 'kpi-value', ratioText, cardUsed);
-
-      if (hasRatio) {
-        const qBar = el('div', 'quota-bar', null, cardUsed);
-        const qFill = el('div', 'quota-fill', null, qBar);
-        const ratioClamped = Math.max(0, Math.min(100, Number(quota.usedRatio) * 100));
-        qFill.style.width = ratioClamped + '%';
-      }
-
-      const remText = '剩余 ' + formatNum(quota.remaining) + ' / 配额 ' + formatNum(quota.limit);
-      el('div', 'kpi-sub', remText, cardUsed);
-
-      // Reset Card
-      const cardReset = el('div', 'kpi-card', null, quotaGrid);
-      el('div', 'kpi-label', '配额重置时间', cardReset);
-      el('div', 'kpi-value', formatDateTime(quota.resetAt), cardReset);
-      const cycleSub = '周期: ' + formatDate(quota.cycleStartDate) + ' ~ ' + formatDate(quota.cycleEndDate);
-      el('div', 'kpi-sub', cycleSub, cardReset);
-
-      // Reference cost conversion (if provided)
-      if (quota.estimatedFullCycleUsd !== null || quota.estimatedRemainingUsd !== null) {
-        const cardRef = el('div', 'kpi-card', null, quotaGrid);
-        el('div', 'kpi-label', '参考费用折算（非余额）', cardRef);
-        el('div', 'kpi-value', '剩余估算 ' + formatUsd(quota.estimatedRemainingUsd), cardRef);
-        el('div', 'kpi-sub', '全周期参考估算 ' + formatUsd(quota.estimatedFullCycleUsd), cardRef);
-      }
-    }
-
-    // Summary KPIs Section
-    const sum = snapshot.summary || {};
-    el('div', 'section-title', isPersonalMode ? '用量总览 (个人)' : '用量总览 (团队)', modalBodyEl);
-
-    const kpiGrid = el('div', 'kpi-grid', null, modalBodyEl);
-
-    // Total Tokens Card
-    const cardTokens = el('div', 'kpi-card', null, kpiGrid);
-    el('div', 'kpi-label', 'Token 总计', cardTokens);
-    el('div', 'kpi-value', formatNum(sum.tokens), cardTokens);
-    const tokenSub = '未缓存 ' + formatNum(sum.uncachedInputTokens) + ' · 缓存 ' + formatNum(sum.cachedInputTokens) + ' · 输出 ' + formatNum(sum.outputTokens);
-    el('div', 'kpi-sub', tokenSub, cardTokens);
-
-    // Reference USD Card
-    const cardCost = el('div', 'kpi-card', null, kpiGrid);
-    el('div', 'kpi-label', '参考费用估算 (USD)', cardCost);
-    el('div', 'kpi-value', formatUsd(sum.estimatedUsd), cardCost);
-    el('div', 'kpi-sub', '按参考费率估算，非实际账单', cardCost);
-
-    // Activity Card
-    const cardAct = el('div', 'kpi-card', null, kpiGrid);
-    el('div', 'kpi-label', '交互统计', cardAct);
-    const actTurns = sum.turns !== null && sum.turns !== undefined && Number.isFinite(Number(sum.turns)) ? formatNum(sum.turns) + ' 轮对话' : '—';
-    el('div', 'kpi-value', actTurns, cardAct);
-    let actSub = '会话: ' + formatNum(sum.threads);
-    if (sum.credits !== null && sum.credits !== undefined && Number.isFinite(Number(sum.credits))) actSub += ' · 积分: ' + formatNum(sum.credits);
-    el('div', 'kpi-sub', actSub, cardAct);
-
-    // Team peak active members (if team mode or present)
-    if (!isPersonalMode && sum.activeMembersPeak !== null && sum.activeMembersPeak !== undefined && Number.isFinite(Number(sum.activeMembersPeak))) {
-      const cardPeak = el('div', 'kpi-card', null, kpiGrid);
-      el('div', 'kpi-label', '日活成员峰值', cardPeak);
-      el('div', 'kpi-value', formatNum(sum.activeMembersPeak) + ' 人', cardPeak);
-      el('div', 'kpi-sub', '单日活跃成员峰值', cardPeak);
-    }
-
-    // Models Breakdown Table
-    const models = Array.isArray(snapshot.models) ? snapshot.models : [];
-    el('div', 'section-title', '模型明细用量 (' + models.length + ')', modalBodyEl);
-
-    if (models.length === 0) {
-      const emptyBox = el('div', 'kpi-card', null, modalBodyEl);
-      el('div', 'kpi-sub', '当前时间区间内暂无模型用量记录', emptyBox);
-    } else {
-      const tableWrap = el('div', 'table-wrap', null, modalBodyEl);
-      const tbl = el('table', 'data-table', null, tableWrap);
-      const thead = el('thead', null, null, tbl);
-      const hRow = el('tr', null, null, thead);
-      el('th', null, '模型名称', hRow);
-      el('th', null, '总 Token', hRow);
-      el('th', null, '未缓存输入', hRow);
-      el('th', null, '缓存输入', hRow);
-      el('th', null, '输出', hRow);
-      el('th', null, '参考费用', hRow);
-      el('th', null, '状态/说明', hRow);
-
-      const tbody = el('tbody', null, null, tbl);
-      for (let i = 0; i < models.length; i++) {
-        const m = models[i];
-        const row = el('tr', null, null, tbody);
-
-        const tdName = el('td', null, null, row);
-        el('strong', null, m.name || '未知模型', tdName);
-        if (m.speed) el('span', 'badge', m.speed, tdName);
-
-        el('td', null, formatNum(m.tokens), row);
-        el('td', null, formatNum(m.uncachedInputTokens), row);
-        el('td', null, formatNum(m.cachedInputTokens), row);
-        el('td', null, formatNum(m.outputTokens), row);
-        el('td', null, formatUsd(m.estimatedUsd), row);
-
-        const tdStatus = el('td', null, null, row);
-        if (m.estimatedAllocation) {
-          el('span', 'badge', '估算分摊', tdStatus, { title: '按积分占比与参考费率分摊，非实测模型拆分' });
-        }
-        if (m.fallbackPricing) {
-          el('span', 'badge', '参考兜底价', tdStatus, { title: '未匹配到确切定价，使用参考兜底价' });
-        }
-        if (m.incompleteImage) {
-          el('span', 'badge', '图像字段不完整', tdStatus, { title: '部分图像用量字段不完整' });
-        }
-        if (m.calculation) {
-          tdStatus.title = m.calculation;
-          if (!m.estimatedAllocation && !m.fallbackPricing && !m.incompleteImage) {
-            el('span', null, m.calculation, tdStatus);
-          }
-        }
-      }
-    }
-
-    // Daily Breakdown List (Collapsible rows, reverse newest first)
-    const daily = Array.isArray(snapshot.daily) ? snapshot.daily.slice() : [];
-    daily.sort((a, b) => {
-      const dateA = a && a.date ? String(a.date) : '';
-      const dateB = b && b.date ? String(b.date) : '';
-      return dateB.localeCompare(dateA);
-    });
-
-    if (daily.length > 0) {
-      el('div', 'section-title', '每日用量明细 (' + daily.length + ' 天)', modalBodyEl);
-      const dailyWrap = el('div', 'table-wrap', null, modalBodyEl);
-
-      for (let d = 0; d < daily.length; d++) {
-        const day = daily[d];
-        const dateStr = formatDate(day.date) || '未知日期';
-        const isExpanded = expandedDates.has(dateStr);
-
-        const rowBtn = el('button', 'daily-row-btn', null, dailyWrap, {
-          type: 'button',
-          'aria-expanded': isExpanded ? 'true' : 'false'
-        });
-
-        const rLeft = el('div', 'daily-row-left', null, rowBtn);
-        const iconSpan = el('span', null, null, rLeft);
-        iconSpan.innerHTML = isExpanded ? SVG_CHEVRON_DOWN : SVG_CHEVRON_RIGHT;
-        el('span', null, dateStr, rLeft);
-
-        const rRight = el('div', 'daily-row-right', null, rowBtn);
-        el('span', null, formatNum(day.tokens) + ' Tokens', rRight);
-        el('span', null, formatNum(day.turns) + ' 轮', rRight);
-        el('span', null, formatUsd(day.estimatedUsd), rRight);
-
-        // Subpanel
-        const subpanel = el('div', 'daily-subpanel', null, dailyWrap);
-        subpanel.style.display = isExpanded ? 'block' : 'none';
-
-        if (Array.isArray(day.models) && day.models.length > 0) {
-          const subTable = el('table', 'data-table', null, subpanel);
-          const stHead = el('thead', null, null, subTable);
-          const stHRow = el('tr', null, null, stHead);
-          el('th', null, '模型', stHRow);
-          el('th', null, 'Tokens', stHRow);
-          el('th', null, '输入(未缓存/缓存)', stHRow);
-          el('th', null, '输出', stHRow);
-          el('th', null, '参考费用', stHRow);
-
-          const stBody = el('tbody', null, null, subTable);
-          for (let mIdx = 0; mIdx < day.models.length; mIdx++) {
-            const dm = day.models[mIdx];
-            const dRow = el('tr', null, null, stBody);
-            el('td', null, dm.name || '—', dRow);
-            el('td', null, formatNum(dm.tokens), dRow);
-            const inText = formatNum(dm.uncachedInputTokens) + ' / ' + formatNum(dm.cachedInputTokens);
-            el('td', null, inText, dRow);
-            el('td', null, formatNum(dm.outputTokens), dRow);
-            el('td', null, formatUsd(dm.estimatedUsd), dRow);
-          }
-        } else {
-          el('div', 'kpi-sub', '当天无模型拆分数据', subpanel);
-        }
-
-        // Accordion click toggle
-        rowBtn.addEventListener('click', () => {
-          if (expandedDates.has(dateStr)) {
-            expandedDates.delete(dateStr);
-            subpanel.style.display = 'none';
-            iconSpan.innerHTML = SVG_CHEVRON_RIGHT;
-            rowBtn.setAttribute('aria-expanded', 'false');
-          } else {
-            expandedDates.add(dateStr);
-            subpanel.style.display = 'block';
-            iconSpan.innerHTML = SVG_CHEVRON_DOWN;
-            rowBtn.setAttribute('aria-expanded', 'true');
-          }
-        });
-      }
-    }
-
-    // Clients & Model Activity (conditional when team mode)
-    if (!isPersonalMode) {
-      const clients = Array.isArray(snapshot.clients) ? snapshot.clients : [];
-      if (clients.length > 0) {
-        el('div', 'section-title', '活跃客户端 (' + clients.length + ')', modalBodyEl);
-        const clWrap = el('div', 'table-wrap', null, modalBodyEl);
-        const clTable = el('table', 'data-table', null, clWrap);
-        const clHead = el('thead', null, null, clTable);
-        const clHRow = el('tr', null, null, clHead);
-        el('th', null, '客户端名称', clHRow);
-        el('th', null, '总 Token', clHRow);
-        el('th', null, '对话数 (Turns)', clHRow);
-        el('th', null, '会话数 (Threads)', clHRow);
-
-        const clBody = el('tbody', null, null, clTable);
-        for (let c = 0; c < clients.length; c++) {
-          const client = clients[c];
-          const row = el('tr', null, null, clBody);
-          el('td', null, client.name || '未知客户端', row);
-          el('td', null, formatNum(client.tokens), row);
-          el('td', null, formatNum(client.turns), row);
-          el('td', null, formatNum(client.threads), row);
-        }
-      }
-
-      const activity = Array.isArray(snapshot.modelActivity) ? snapshot.modelActivity : [];
-      if (activity.length > 0) {
-        el('div', 'section-title', '模型活动度统计 (' + activity.length + ')', modalBodyEl);
-        const actWrap = el('div', 'table-wrap', null, modalBodyEl);
-        const actTable = el('table', 'data-table', null, actWrap);
-        const actHead = el('thead', null, null, actTable);
-        const actHRow = el('tr', null, null, actHead);
-        el('th', null, '模型', actHRow);
-        el('th', null, '对话数', actHRow);
-        el('th', null, '会话数', actHRow);
-        el('th', null, '日活成员峰值', actHRow);
-
-        const actBody = el('tbody', null, null, actTable);
-        for (let a = 0; a < activity.length; a++) {
-          const item = activity[a];
-          const row = el('tr', null, null, actBody);
-          el('td', null, item.name || '—', row);
-          el('td', null, formatNum(item.turns), row);
-          el('td', null, formatNum(item.threads), row);
-          el('td', null, (item.activeMembersPeak !== null && item.activeMembersPeak !== undefined && Number.isFinite(Number(item.activeMembersPeak))) ? formatNum(item.activeMembersPeak) + ' 人' : '—', row);
-        }
-      }
-    }
-
-    // Notices box
-    const notices = Array.isArray(snapshot.notices) ? snapshot.notices : [];
-    if (notices.length > 0) {
-      const nBox = el('div', 'notices-box', null, modalBodyEl);
-      el('strong', null, '提示与说明:', nBox);
-      const ul = el('ul', null, null, nBox);
-      for (let n = 0; n < notices.length; n++) {
-        el('li', null, notices[n], ul);
-      }
-    }
-
-    // Restore scroll
-    modalBodyEl.scrollTop = scrollPos;
-
-    lastRenderedSignature = currentSig;
-    lastRenderedAccount = snapshot.accountId || null;
-    lastRenderedRange = snapshot.range ? { ...snapshot.range } : null;
   }
+  window.addEventListener('keydown', handleWindowKeyDown);
 
-  // Account / Profile Menu Injection & Coordination
+  // Native account menu injection
   let currentMenuItem = null;
   let currentPersItem = null;
   let currentSettItem = null;
@@ -4286,7 +6525,6 @@ function mountTeamUsagePanel(options) {
       const profileBtn = document.querySelector('[data-testid="accounts-profile-button"]');
       lastFocusedTrigger = profileBtn || item;
 
-      // Close menu cleanly via synthetic Escape on menu
       try {
         menu.dispatchEvent(new KeyboardEvent('keydown', {
           key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true
@@ -4311,7 +6549,6 @@ function mountTeamUsagePanel(options) {
           return;
         }
 
-        // At frame 8, if still visible, attempt pointerdown/up/click on profile trigger only if aria-expanded="true"
         if (frames === 8) {
           const trigger = document.querySelector('[data-testid="accounts-profile-button"]');
           if (trigger && trigger.getAttribute('aria-expanded') === 'true') {
@@ -4328,7 +6565,6 @@ function mountTeamUsagePanel(options) {
           safeRequestAnimationFrame(checkAndOpen);
         } else {
           isClickPending = false;
-          // Do NOT show modal while old Radix modal remains visibly open
           if (!isElementVisible(menu)) {
             openModal();
           }
@@ -4366,7 +6602,6 @@ function mountTeamUsagePanel(options) {
       }
     });
 
-    // Keyboard bridge between native items
     persKeyHandler = (e) => {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -4464,7 +6699,6 @@ function mountTeamUsagePanel(options) {
     settKeyHandler = null;
   }
 
-  // Scoped MutationObserver for account menu detection
   let rAfQueued = false;
   function scheduleScan() {
     if (destroyed || rAfQueued) return;
@@ -4533,22 +6767,18 @@ function mountTeamUsagePanel(options) {
   });
 
   observer.observe(document.body, { childList: true, subtree: true });
-
-  // Initial check
   scheduleScan();
 
-  // Route & Account Switch Listeners
   function handleRouteChange() {
     if (isModalOpen) closeModal(false);
   }
   window.addEventListener('popstate', handleRouteChange);
 
-  // Return Controller
   return {
     update(nextSnapshot) {
       if (destroyed || !nextSnapshot || typeof nextSnapshot !== 'object') return;
 
-      const nextAcc = (nextSnapshot.accountId !== undefined) ? nextSnapshot.accountId : null;
+      const nextAcc = nextSnapshot.accountId !== undefined ? nextSnapshot.accountId : null;
       if (!initialAccountObserved) {
         currentActiveAccount = nextAcc;
         if (nextAcc !== null) {
@@ -4557,19 +6787,20 @@ function mountTeamUsagePanel(options) {
       } else if (nextAcc !== currentActiveAccount) {
         currentActiveAccount = nextAcc;
         dateInputDirty = false;
-        expandedDates.clear();
         localStartDate = '';
         localEndDate = '';
-        lastRenderedSignature = null;
+        state.expandedDates.clear();
         if (isModalOpen) {
           closeModal(false);
         }
       }
 
       snapshot = nextSnapshot;
+      syncStateFromSnapshot();
 
+      // Snapshot updates during closed must not mount visible or call updatePanel
       if (isModalOpen) {
-        renderModalContent();
+        updatePanel();
       }
     },
     destroy() {
@@ -4599,34 +6830,44 @@ function mountTeamUsagePanel(options) {
       observer.disconnect();
       cleanupMenuItem();
       window.removeEventListener('popstate', handleRouteChange);
+      window.removeEventListener('keydown', handleWindowKeyDown);
 
       if (host && host.parentNode) {
-        host.parentNode.removeChild(host);
+        try { host.parentNode.removeChild(host); } catch (_) {}
       }
     }
   };
 }
 
+
 function createTeamBillingController(onChange) {
-  var TIMEOUT_MS = 18000;
+  var API_TIMEOUT_MS = 18000;
+  var DEADLINE_MS = 60000;
+  var PAY_ORIGIN = 'https://pay.openai.com';
+  var CHANNEL = 'chatgpt-scripts:official-billing';
+  var VERSION = 1;
   var MISSING_ACCOUNT = '无法确认当前工作空间，请先切换到要查询的空间';
-  var NOTICE = '当前接口只返回历史发票，未提供下一期账单预估；可前往官方账单管理页查看。';
-  var win = typeof window === 'undefined' ? null : window;
-  var doc = typeof document === 'undefined' ? null : document;
+  var OFFICIAL_NOTICE = '读取自本次打开的官方账单页，预计金额可能随套餐或席位变化。';
+  var HISTORY_NOTICE = '当前接口只返回历史发票；官方账单页可提供下一笔预计付款。';
+  var win = typeof window === 'object' ? window : null;
+  var doc = typeof document === 'object' ? document : null;
   var destroyed = false;
   var generation = 0;
   var active = null;
   var accountWatcher = null;
   var emitting = false;
   var emitPending = false;
-  var state = makeState('idle', null, accountCookie(), [], false, null, '');
+  var state = makeState('idle', null, accountCookie(), [], false, null, '', null, null, null);
 
-  function makeState(status, error, accountId, history, hasMore, manageUrl, notice) {
+  function makeState(status, error, accountId, history, hasMore, manageUrl, notice, dateText, amountText, source) {
     return {
       status: status,
       error: error,
       accountId: accountId,
-      upcomingAvailable: false,
+      upcomingAvailable: source === 'official-page',
+      upcomingDateText: dateText,
+      upcomingAmountText: amountText,
+      source: source,
       notice: notice,
       history: copyHistory(history),
       hasMore: hasMore === true,
@@ -4655,7 +6896,10 @@ function createTeamBillingController(onChange) {
       status: state.status,
       error: state.error,
       accountId: state.accountId,
-      upcomingAvailable: false,
+      upcomingAvailable: state.upcomingAvailable,
+      upcomingDateText: state.upcomingDateText,
+      upcomingAmountText: state.upcomingAmountText,
+      source: state.source,
       notice: state.notice,
       history: copyHistory(state.history),
       hasMore: state.hasMore,
@@ -4670,10 +6914,9 @@ function createTeamBillingController(onChange) {
 
   function syncAccountWatcher() {
     if (!destroyed && shouldWatchAccount() && accountWatcher === null && win && typeof win.setInterval === 'function') {
-      // Detection-only cleanup for account changes in a focused SPA; this never polls an API.
       accountWatcher = win.setInterval(accountAwareness, 1000);
     } else if ((destroyed || !shouldWatchAccount()) && accountWatcher !== null) {
-      if (win && typeof win.clearInterval === 'function') win.clearInterval(accountWatcher);
+      win.clearInterval(accountWatcher);
       accountWatcher = null;
     }
   }
@@ -4692,11 +6935,7 @@ function createTeamBillingController(onChange) {
     emitting = true;
     do {
       emitPending = false;
-      try {
-        onChange(snapshot());
-      } catch (ignored) {
-        // A consumer callback cannot affect requests or controller state.
-      }
+      try { onChange(snapshot()); } catch (ignored) {}
     } while (!destroyed && emitPending);
     emitting = false;
   }
@@ -4709,126 +6948,19 @@ function createTeamBillingController(onChange) {
       var name = (splitAt < 0 ? parts[index] : parts[index].slice(0, splitAt)).trim();
       if (name !== '_account') continue;
       var value;
-      try {
-        value = decodeURIComponent(splitAt < 0 ? '' : parts[index].slice(splitAt + 1)).trim();
-      } catch (ignored) {
-        return null;
-      }
-      while (value.length >= 2 && ((value[0] === '"' && value[value.length - 1] === '"') || (value[0] === "'" && value[value.length - 1] === "'"))) {
-        value = value.slice(1, -1).trim();
-      }
+      try { value = decodeURIComponent(splitAt < 0 ? '' : parts[index].slice(splitAt + 1)).trim(); } catch (ignored) { return null; }
+      while (value.length >= 2 && ((value[0] === '"' && value[value.length - 1] === '"') || (value[0] === "'" && value[value.length - 1] === "'"))) value = value.slice(1, -1).trim();
       if (!value || value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)) return null;
-      try {
-        encodeURIComponent(value);
-      } catch (ignoredEncoding) {
-        return null;
-      }
+      try { encodeURIComponent(value); } catch (ignoredEncoding) { return null; }
       return value;
     }
     return null;
   }
 
-  function stopActive() {
-    if (!active) return;
-    var request = active;
-    active = null;
-    if (request.timer) clearTimeout(request.timer);
-    try {
-      request.controller.abort();
-    } catch (ignored) {
-      // The request may already be complete.
-    }
-  }
-
-  function resetForAccountChange() {
-    generation += 1;
-    stopActive();
-    setState(makeState('idle', null, accountCookie(), [], false, null, ''));
-    emit();
-  }
-
-  function stillCurrent(accountId, requestGeneration) {
-    if (destroyed || requestGeneration !== generation) return false;
-    if (accountCookie() === accountId) return true;
-    resetForAccountChange();
-    return false;
-  }
-
-  function getSnapshot() {
-    if (!destroyed && accountCookie() !== state.accountId) resetForAccountChange();
-    return snapshot();
-  }
-
-  function currencyCode(value) {
-    if (typeof value !== 'string' || !/^[A-Za-z]{3}$/.test(value)) return null;
-    if (typeof Intl !== 'object' || typeof Intl.NumberFormat !== 'function') return null;
-    var code = value.toUpperCase();
-    try {
-      if (typeof Intl.supportedValuesOf === 'function' && code !== 'ISK' && code !== 'UGX' && Intl.supportedValuesOf('currency').indexOf(code) === -1) return null;
-      new Intl.NumberFormat('zh-CN', { style: 'currency', currency: code });
-      return code;
-    } catch (ignored) {
-      return null;
-    }
-  }
-
-  function money(value, currency) {
-    if (!currency || !Number.isSafeInteger(value)) return null;
-    try {
-      var formatter = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: currency, currencyDisplay: 'code' });
-      var digits = currency === 'ISK' || currency === 'UGX' ? 2 : formatter.resolvedOptions().maximumFractionDigits;
-      return formatter.format(value / Math.pow(10, digits));
-    } catch (ignored) {
-      return null;
-    }
-  }
-
-  function epoch(value) {
-    if (typeof value !== 'number' || !Number.isFinite(value)) return { iso: null, seconds: null };
-    var date = new Date(value * 1000);
-    return Number.isFinite(date.getTime()) ? { iso: date.toISOString(), seconds: value } : { iso: null, seconds: null };
-  }
-
-  function statusOf(value) {
-    var status = typeof value === 'string' ? value.toLowerCase() : '';
-    return /^(draft|open|paid|uncollectible|void)$/.test(status) ? status : 'unknown';
-  }
-
-  function parseInvoice(row) {
-    var created = epoch(row.created);
-    var currency = currencyCode(row.currency);
-    return {
-      seconds: created.seconds,
-      value: {
-        createdAt: created.iso,
-        periodStart: epoch(row.period_start).iso,
-        periodEnd: epoch(row.period_end).iso,
-        status: statusOf(row.status),
-        currency: currency,
-        totalText: money(row.total, currency),
-        amountDueText: money(row.amount_due, currency),
-        amountPaidText: money(row.amount_paid, currency)
-      }
-    };
-  }
-
-  function parseHistory(payload) {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.data)) throw { type: 'json' };
-    var rows = payload.data;
-    var invoices = [];
-    rows.forEach(function (row) {
-      if (row && typeof row === 'object' && row.object === 'invoice') invoices.push(parseInvoice(row));
-    });
-    invoices.sort(function (left, right) {
-      if (left.seconds === null) return right.seconds === null ? 0 : 1;
-      if (right.seconds === null) return -1;
-      return right.seconds - left.seconds;
-    });
-    return {
-      history: invoices.slice(0, 10).map(function (entry) { return entry.value; }),
-      hasMore: payload.has_more === true,
-      unsupportedOnly: !!(rows.length && !invoices.length)
-    };
+  function safeManageUrl(accountId) {
+    var origin = typeof location === 'object' && typeof location.origin === 'string' ? location.origin : '';
+    if (origin !== 'https://chatgpt.com' && origin !== 'https://chat.openai.com') return null;
+    return origin + '/account/manage?account_id=' + encodeURIComponent(accountId);
   }
 
   function isPlainObject(value) {
@@ -4855,18 +6987,60 @@ function createTeamBillingController(onChange) {
     return false;
   }
 
+  function currencyCode(value) {
+    if (typeof value !== 'string' || !/^[A-Za-z]{3}$/.test(value) || typeof Intl !== 'object' || typeof Intl.NumberFormat !== 'function') return null;
+    var code = value.toUpperCase();
+    try {
+      if (typeof Intl.supportedValuesOf === 'function' && code !== 'ISK' && code !== 'UGX' && Intl.supportedValuesOf('currency').indexOf(code) === -1) return null;
+      new Intl.NumberFormat('zh-CN', { style: 'currency', currency: code });
+      return code;
+    } catch (ignored) { return null; }
+  }
+
+  function money(value, currency) {
+    if (!currency || !Number.isSafeInteger(value)) return null;
+    try {
+      var formatter = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: currency, currencyDisplay: 'code' });
+      var digits = currency === 'ISK' || currency === 'UGX' ? 2 : formatter.resolvedOptions().maximumFractionDigits;
+      return formatter.format(value / Math.pow(10, digits));
+    } catch (ignored) { return null; }
+  }
+
+  function epoch(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return { iso: null, seconds: null };
+    var date = new Date(value * 1000);
+    return Number.isFinite(date.getTime()) ? { iso: date.toISOString(), seconds: value } : { iso: null, seconds: null };
+  }
+
+  function parseHistory(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !Array.isArray(payload.data)) throw { type: 'json' };
+    var invoices = [];
+    payload.data.forEach(function (row) {
+      if (!row || typeof row !== 'object' || row.object !== 'invoice') return;
+      var created = epoch(row.created);
+      var currency = currencyCode(row.currency);
+      var status = typeof row.status === 'string' && /^(draft|open|paid|uncollectible|void)$/i.test(row.status) ? row.status.toLowerCase() : 'unknown';
+      invoices.push({ seconds: created.seconds, value: {
+        createdAt: created.iso, periodStart: epoch(row.period_start).iso, periodEnd: epoch(row.period_end).iso,
+        status: status, currency: currency, totalText: money(row.total, currency),
+        amountDueText: money(row.amount_due, currency), amountPaidText: money(row.amount_paid, currency)
+      } });
+    });
+    invoices.sort(function (left, right) {
+      if (left.seconds === null) return right.seconds === null ? 0 : 1;
+      if (right.seconds === null) return -1;
+      return right.seconds - left.seconds;
+    });
+    return { history: invoices.slice(0, 10).map(function (entry) { return entry.value; }), hasMore: payload.has_more === true, unsupportedOnly: !!(payload.data.length && !invoices.length) };
+  }
+
   async function getJson(url, options) {
     var response = await fetch(url, options);
     if (!response || response.status < 200 || response.status >= 300) throw { type: 'http', status: response ? response.status : 0 };
-    try {
-      return await response.json();
-    } catch (ignored) {
-      throw { type: 'json' };
-    }
+    try { return await response.json(); } catch (ignored) { throw { type: 'json' }; }
   }
 
-  function requestError(error, timedOut) {
-    if (timedOut) return '请求超时（18 秒），请稍后重试';
+  function requestError(error) {
     if (error && error.type === 'http') {
       if (error.status === 401) return '登录或会话已失效，请重新登录后重试';
       if (error.status === 403) return '无权限访问当前工作空间的账单记录';
@@ -4876,101 +7050,236 @@ function createTeamBillingController(onChange) {
     return error && error.type === 'json' ? '账单数据格式无效' : '无法加载账单数据，请稍后重试';
   }
 
-  function fail(accountId, requestGeneration, message) {
-    if (!stillCurrent(accountId, requestGeneration)) return;
-    setState(makeState('error', message, accountId, [], false, null, ''));
-    emit();
+  function createNonce() {
+    var crypt = win && win.crypto;
+    if (!crypt || typeof crypt.getRandomValues !== 'function') return null;
+    var bytes = new Uint8Array(16);
+    crypt.getRandomValues(bytes);
+    return Array.prototype.map.call(bytes, function (byte) { return ('0' + byte.toString(16)).slice(-2); }).join('');
   }
 
-  async function runLoad(accountId, requestGeneration, request) {
+  function resolveRequest(request) {
+    if (!request || request.resolved) return;
+    request.resolved = true;
+    request.resolve(snapshot());
+  }
+
+  function tellChildToStop(request) {
+    if (!request || !request.navigated || !request.acked || !request.popup) return;
+    try { request.popup.postMessage({ channel: CHANNEL, v: VERSION, type: 'cancel', nonce: request.nonce }, PAY_ORIGIN); } catch (ignored) {}
+  }
+
+  function detachRequest(request, closeNavigated) {
+    if (!request || request.settled) return;
+    request.settled = true;
+    if (request.apiTimer) clearTimeout(request.apiTimer);
+    if (request.deadlineTimer) clearTimeout(request.deadlineTimer);
+    if (request.helloTimer) clearInterval(request.helloTimer);
+    if (request.messageHandler && win) win.removeEventListener('message', request.messageHandler);
+    try { request.controller.abort(); } catch (ignored) {}
+    if (request.popup && (!request.navigated || closeNavigated)) {
+      try { request.popup.close(); } catch (ignoredClose) {}
+    }
+    request.popup = null;
+    if (active === request) active = null;
+  }
+
+  function stopActive() {
+    if (!active) return null;
+    var request = active;
+    tellChildToStop(request);
+    detachRequest(request, false);
+    return request;
+  }
+
+  function resetForAccountChange() {
+    var prior = stopActive();
+    generation += 1;
+    setState(makeState('idle', null, accountCookie(), [], false, null, '', null, null, null));
+    emit();
+    resolveRequest(prior);
+  }
+
+  function stillCurrent(request) {
+    if (destroyed || request.generation !== generation || request.settled) return false;
+    if (accountCookie() === request.accountId) return true;
+    resetForAccountChange();
+    return false;
+  }
+
+  function getSnapshot() {
+    if (!destroyed && accountCookie() !== state.accountId) resetForAccountChange();
+    return snapshot();
+  }
+
+  function finish(request, nextState, closeNavigated) {
+    if (!stillCurrent(request)) return;
+    setState(nextState);
+    emit();
+    detachRequest(request, closeNavigated);
+    resolveRequest(request);
+  }
+
+  function finishError(request, message) {
+    if (!stillCurrent(request)) return;
+    var prior = state.accountId === request.accountId ? state : null;
+    tellChildToStop(request);
+    finish(request, makeState('error', message, request.accountId, prior ? prior.history : [], prior ? prior.hasMore : false,
+      safeManageUrl(request.accountId), prior && prior.history.length ? prior.notice : '', null, null, null), false);
+  }
+
+  function validOfficialText(value, kind) {
+    if (typeof value !== 'string' || value.length < 2 || value.length > 200 || /[\u0000-\u001f\u007f]/.test(value) || !/\d/.test(value)) return false;
+    var prefixes = kind === 'date'
+      ? ['您的下一个账单日期是', '您的下一個帳單日期是', '您的下個帳單日期是', 'Your next invoice date', 'Your next bill date']
+      : ['您的下一笔付款预计为', '您的下一筆付款預計為', '您的下筆付款預計為', 'Your next payment is estimated', 'Your next payment'];
+    for (var index = 0; index < prefixes.length; index += 1) {
+      if (value.slice(0, prefixes[index].length).toLowerCase() === prefixes[index].toLowerCase()) return true;
+    }
+    return false;
+  }
+
+  function messageFor(request, event) {
+    if (!stillCurrent(request) || event.origin !== PAY_ORIGIN || event.source !== request.popup) return;
+    var data = event.data;
+    if (!isPlainObject(data) || data.channel !== CHANNEL || data.v !== VERSION || data.nonce !== request.nonce) return;
+    if (data.type === 'ack') {
+      request.acked = true;
+      if (request.helloTimer) clearInterval(request.helloTimer);
+      request.helloTimer = null;
+      return;
+    }
+    if (!request.acked) return;
+    if (data.type === 'result' && validOfficialText(data.dateText, 'date') && validOfficialText(data.amountText, 'amount')) {
+      var prior = state.accountId === request.accountId ? state : null;
+      finish(request, makeState('ready', null, request.accountId, prior ? prior.history : [], prior ? prior.hasMore : false,
+        safeManageUrl(request.accountId), OFFICIAL_NOTICE, data.dateText, data.amountText, 'official-page'), true);
+    } else if (data.type === 'error' || data.type === 'cancel') {
+      finishError(request, '官方账单页未提供可读取的预计付款，请直接查看官方页面。');
+    }
+  }
+
+  function sendHello(request) {
+    if (!stillCurrent(request) || request.acked) return;
+    try { request.popup.postMessage({ channel: CHANNEL, v: VERSION, type: 'hello', nonce: request.nonce }, PAY_ORIGIN); } catch (ignored) {}
+  }
+
+  function startHistory(request, headers) {
+    getJson('/backend-api/invoices?limit=10&account_id=' + encodeURIComponent(request.accountId), {
+      method: 'GET', credentials: 'include', cache: 'no-store', headers: headers, signal: request.controller.signal
+    }).then(function (payload) {
+      if (!stillCurrent(request)) return;
+      var parsed = parseHistory(payload);
+      if (request.settled || state.status !== 'loading') return;
+      setState(makeState('loading', null, request.accountId, parsed.history, parsed.hasMore, safeManageUrl(request.accountId),
+        HISTORY_NOTICE + (parsed.unsupportedOnly ? ' 当前接口未返回可识别的历史发票记录。' : ''), null, null, null));
+      emit();
+    }).catch(function () {
+      // History is optional and must not delay or replace the official-page result.
+    });
+  }
+
+  async function runLoad(request) {
     var token = '';
     var headers = null;
     try {
-      if (!stillCurrent(accountId, requestGeneration)) return getSnapshot();
+      if (!stillCurrent(request)) return;
       var session = await getJson('/api/auth/session', {
-        method: 'GET', credentials: 'include', cache: 'no-store',
-        headers: { Accept: 'application/json' }, signal: request.controller.signal
+        method: 'GET', credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' }, signal: request.controller.signal
       });
-      if (!stillCurrent(accountId, requestGeneration)) return getSnapshot();
+      if (!stillCurrent(request)) return;
       token = session && typeof session.accessToken === 'string' ? session.accessToken.trim() : '';
-      if (!token || /[\r\n]/.test(token)) {
-        fail(accountId, requestGeneration, '登录或会话已失效，请重新登录后重试');
-        return getSnapshot();
-      }
+      if (!token || /[\r\n]/.test(token)) return finishError(request, '登录或会话已失效，请重新登录后重试');
       headers = { Accept: 'application/json', Authorization: 'Bearer ' + token };
       var accounts = await getJson('/backend-api/accounts/check/v4-2023-04-27', {
         method: 'GET', credentials: 'include', cache: 'no-store', headers: headers, signal: request.controller.signal
       });
-      if (!stillCurrent(accountId, requestGeneration)) return getSnapshot();
-      if (!accountMatches(accounts, accountId)) {
-        fail(accountId, requestGeneration, '无法验证当前工作空间访问权限');
-        return getSnapshot();
+      if (!stillCurrent(request)) return;
+      if (!accountMatches(accounts, request.accountId)) return finishError(request, '无法验证当前工作空间访问权限');
+      if (request.apiTimer) clearTimeout(request.apiTimer);
+      request.apiTimer = null;
+      var manageUrl = safeManageUrl(request.accountId);
+      if (!manageUrl) return finishError(request, '无法打开官方账单页，请直接查看官方页面。');
+      startHistory(request, headers);
+      request.messageHandler = function (event) { messageFor(request, event); };
+      win.addEventListener('message', request.messageHandler);
+      if (!stillCurrent(request)) return;
+      try {
+        request.popup.location = manageUrl;
+        request.navigated = true;
+      } catch (navigationError) {
+        return finishError(request, '无法打开官方账单页，请直接查看官方页面。');
       }
-      var invoices = await getJson('/backend-api/invoices?limit=10&account_id=' + encodeURIComponent(accountId), {
-        method: 'GET', credentials: 'include', cache: 'no-store', headers: headers, signal: request.controller.signal
-      });
-      if (!stillCurrent(accountId, requestGeneration)) return getSnapshot();
-      var parsed = parseHistory(invoices);
-      setState(makeState('ready', null, accountId, parsed.history, parsed.hasMore,
-        typeof location === 'object' && location.origin ? location.origin + '/account/manage?account_id=' + encodeURIComponent(accountId) : null,
-        NOTICE + (parsed.unsupportedOnly ? ' 当前接口未返回可识别的历史发票记录。' : '')));
-      emit();
+      if (!stillCurrent(request)) return;
+      sendHello(request);
+      request.helloTimer = setInterval(function () { sendHello(request); }, 500);
     } catch (error) {
-      if (destroyed || requestGeneration !== generation || !stillCurrent(accountId, requestGeneration)) return getSnapshot();
-      if (request.timedOut) fail(accountId, requestGeneration, requestError(error, true));
-      else if (error && error.name === 'AbortError') {
-        setState(makeState('idle', null, accountCookie(), [], false, null, ''));
-        emit();
-      } else fail(accountId, requestGeneration, requestError(error, false));
+      if (!request.settled && stillCurrent(request)) finishError(request, requestError(error));
     } finally {
       token = '';
       if (headers) delete headers.Authorization;
       headers = null;
-      if (active && active.generation === requestGeneration) {
-        if (active.timer) clearTimeout(active.timer);
-        active = null;
-      }
     }
-    return getSnapshot();
   }
 
   function load() {
     if (destroyed) return Promise.resolve(snapshot());
+    var startedAt = Date.now();
+    var prior = stopActive();
     generation += 1;
-    stopActive();
-    var requestGeneration = generation;
     var accountId = accountCookie();
     if (!accountId) {
-      setState(makeState('error', MISSING_ACCOUNT, null, [], false, null, ''));
+      setState(makeState('error', MISSING_ACCOUNT, null, [], false, null, '', null, null, null));
       emit();
+      resolveRequest(prior);
+      return Promise.resolve(snapshot());
+    }
+    var nonce = createNonce();
+    if (!nonce || !win || typeof win.open !== 'function') {
+      setState(makeState('error', '当前环境无法打开官方账单页，请稍后重试', accountId, [], false, safeManageUrl(accountId), '', null, null, null));
+      emit();
+      resolveRequest(prior);
+      return Promise.resolve(snapshot());
+    }
+    var popup = win.open('about:blank', '_blank');
+    if (!popup) {
+      setState(makeState('error', '浏览器未允许打开官方账单页，请允许本站弹出窗口后重试。', accountId, [], false, safeManageUrl(accountId), '', null, null, null));
+      emit();
+      resolveRequest(prior);
       return Promise.resolve(snapshot());
     }
     if (typeof fetch !== 'function' || typeof AbortController === 'undefined') {
-      setState(makeState('error', '当前环境无法加载账单数据，请稍后重试', accountId, [], false, null, ''));
+      try { popup.close(); } catch (ignored) {}
+      setState(makeState('error', '当前环境无法加载账单数据，请稍后重试', accountId, [], false, safeManageUrl(accountId), '', null, null, null));
       emit();
+      resolveRequest(prior);
       return Promise.resolve(snapshot());
     }
-    var request = { generation: requestGeneration, controller: new AbortController(), timer: null, timedOut: false };
+    var request = { generation: generation, accountId: accountId, popup: popup, navigated: false, nonce: nonce, acked: false,
+      controller: new AbortController(), apiTimer: null, deadlineTimer: null, helloTimer: null, messageHandler: null, settled: false, resolved: false, resolve: null };
+    request.promise = new Promise(function (resolve) { request.resolve = resolve; });
     active = request;
-    request.timer = setTimeout(function () {
-      if (!destroyed && active && active.generation === requestGeneration) {
-        active.timedOut = true;
-        try { active.controller.abort(); } catch (ignored) {}
-      }
-    }, TIMEOUT_MS);
-    setState(makeState('loading', null, accountId, [], false, null, ''));
+    request.apiTimer = setTimeout(function () {
+      if (!request.settled && stillCurrent(request)) finishError(request, '请求超时（18 秒），请稍后重试');
+    }, API_TIMEOUT_MS);
+    request.deadlineTimer = setTimeout(function () {
+      if (!request.settled && stillCurrent(request)) finishError(request, '官方页面与当前页面的连接已中断，请直接查看官方页面。');
+    }, Math.max(0, DEADLINE_MS - (Date.now() - startedAt)));
+    setState(makeState('loading', null, accountId, [], false, safeManageUrl(accountId), '', null, null, null));
     emit();
-    return runLoad(accountId, requestGeneration, request);
+    runLoad(request);
+    resolveRequest(prior);
+    return request.promise;
   }
 
   function cancel() {
     if (destroyed || state.status !== 'loading') return snapshot();
+    var request = stopActive();
     generation += 1;
-    stopActive();
     var currentAccountId = accountCookie();
-    var idleAccountId = currentAccountId === state.accountId ? state.accountId : currentAccountId;
-    setState(makeState('idle', null, idleAccountId, [], false, null, ''));
+    setState(makeState('idle', null, currentAccountId === state.accountId ? state.accountId : currentAccountId, [], false, null, '', null, null, null));
     emit();
+    resolveRequest(request);
     return snapshot();
   }
 
@@ -4983,20 +7292,22 @@ function createTeamBillingController(onChange) {
 
   function destroy() {
     if (destroyed) return;
+    var request = stopActive();
     destroyed = true;
     generation += 1;
-    stopActive();
-    if (win && typeof win.removeEventListener === 'function') win.removeEventListener('focus', accountAwareness);
-    if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', accountAwareness);
-    setState(makeState('idle', null, null, [], false, null, ''));
+    if (win) win.removeEventListener('focus', accountAwareness);
+    if (doc) doc.removeEventListener('visibilitychange', accountAwareness);
+    setState(makeState('idle', null, null, [], false, null, '', null, null, null));
+    resolveRequest(request);
   }
 
   return { getSnapshot: getSnapshot, load: load, cancel: cancel, destroy: destroy };
 }
 
+
 /**
- * Team 助手 - 账单查询 UI 模块 (mountTeamBillingPanel)
- * 提供“查看下月账单”按钮与原生 <dialog> 弹窗，呈现历史发票及官方账单管理入口。
+ * Team 助手 - 官方账单与下期预估 UI 模块 (mountTeamBillingPanel)
+ * 提供“查看下月账单”原生样式按钮与原生 <dialog> 弹窗，呈现官方下期账单（下次日期与预计金额）及历史发票。
  */
 function mountTeamBillingPanel(options) {
     'use strict';
@@ -5008,6 +7319,9 @@ function mountTeamBillingPanel(options) {
             error: null,
             accountId: null,
             upcomingAvailable: false,
+            upcomingDateText: null,
+            upcomingAmountText: null,
+            source: null,
             notice: '',
             history: [],
             hasMore: false,
@@ -5034,15 +7348,31 @@ function mountTeamBillingPanel(options) {
         for (var j = 0; j < oldP.length; j++) oldP[j].remove();
     } catch (_) {}
 
+    // Trigger 在 Light DOM 中渲染，直接复用页面原生管理席位按钮 class，继承原生背景色、边框、字体与悬停效果
     var btnHost = document.createElement('div');
     btnHost.setAttribute('data-team-billing-btn', '');
     btnHost.style.display = 'none';
+    btnHost.style.alignItems = 'center';
+    btnHost.style.margin = '0';
+    btnHost.style.padding = '0';
+    btnHost.style.lineHeight = '0';
+    btnHost.style.flexShrink = '0';
 
+    var triggerBtn = document.createElement('button');
+    triggerBtn.type = 'button';
+    triggerBtn.setAttribute('data-team-billing-trigger', '');
+    triggerBtn.className = 'btn relative btn-secondary btn-large';
+    triggerBtn.textContent = '查看下月账单';
+    triggerBtn.setAttribute('aria-haspopup', 'dialog');
+    triggerBtn.setAttribute('aria-expanded', 'false');
+    triggerBtn.addEventListener('click', onTriggerClick);
+    btnHost.appendChild(triggerBtn);
+
+    // Panel 保持在独立 Shadow DOM 中，避免污染全局页面样式
     var panelHost = document.createElement('div');
     panelHost.setAttribute('data-team-billing-panel', '');
     (document.body || document.documentElement).appendChild(panelHost);
 
-    var btnShadow = btnHost.attachShadow({ mode: 'open' });
     var panelShadow = panelHost.attachShadow({ mode: 'open' });
 
     var CSS_VARS = `
@@ -5065,31 +7395,6 @@ function mountTeamBillingPanel(options) {
         }
     `;
 
-    var btnStyle = document.createElement('style');
-    btnStyle.textContent = CSS_VARS + `
-        :host { display: inline-flex; align-items: center; margin: 0; padding: 0; line-height: 0; flex-shrink: 0; }
-        .cg-tb-btn {
-            height: 44px; padding: 0 16px; margin: 0; box-sizing: border-box; display: inline-flex; align-items: center;
-            justify-content: center; border-radius: 9999px; border: 1px solid var(--border-light, var(--tb-border));
-            background: transparent; color: var(--text-primary, var(--tb-text)); font-family: inherit; font-size: 14px;
-            font-weight: 500; cursor: pointer; outline: none; user-select: none; white-space: nowrap;
-            transition: background-color 0.15s ease, border-color 0.15s ease;
-        }
-        .cg-tb-btn:hover { background: var(--main-surface-secondary, var(--tb-bg-hover)); border-color: var(--border-light, var(--tb-border)); }
-        .cg-tb-btn:active { background: var(--tb-bg-active); transform: scale(0.99); }
-        .cg-tb-btn:focus-visible { outline: 2px solid var(--tb-ring); outline-offset: 2px; }
-    `;
-    btnShadow.appendChild(btnStyle);
-
-    var triggerBtn = document.createElement('button');
-    triggerBtn.type = 'button';
-    triggerBtn.className = 'cg-tb-btn';
-    triggerBtn.textContent = '查看下月账单';
-    triggerBtn.setAttribute('aria-haspopup', 'dialog');
-    triggerBtn.setAttribute('aria-expanded', 'false');
-    triggerBtn.addEventListener('click', onTriggerClick);
-    btnShadow.appendChild(triggerBtn);
-
     var panelStyle = document.createElement('style');
     panelStyle.textContent = CSS_VARS + `
         .cg-tb-dialog {
@@ -5108,10 +7413,17 @@ function mountTeamBillingPanel(options) {
         .cg-tb-close:focus-visible { outline: 2px solid var(--tb-ring); }
         @media (pointer: coarse) { .cg-tb-close { min-width: 44px; min-height: 44px; } }
         .cg-tb-body { padding: 20px 24px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 20px; min-height: 0; }
-        .cg-tb-card { padding: 14px 16px; background: var(--tb-card-bg); border: 1px solid var(--tb-border-subtle); border-radius: 10px; display: flex; flex-direction: column; gap: 6px; }
-        .cg-tb-card-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text-primary, var(--tb-text)); }
+        .cg-tb-card { padding: 16px 18px; background: var(--tb-card-bg); border: 1px solid var(--tb-border-subtle); border-radius: 12px; display: flex; flex-direction: column; gap: 8px; }
+        .cg-tb-card-head { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary, var(--tb-text)); }
         .cg-tb-dot { width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; flex-shrink: 0; }
-        .cg-tb-card-desc { margin: 0; font-size: 13px; color: var(--text-secondary, var(--tb-text-sec)); line-height: 1.5; }
+        .cg-tb-dot.green { background: #22c55e; }
+        .cg-tb-dot.blue { background: #3b82f6; }
+        .cg-tb-dot.amber { background: #f59e0b; }
+        .cg-tb-dot.gray { background: #8e8e8e; }
+        .cg-tb-upcoming-row { display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }
+        .cg-tb-upcoming-date { font-size: 13.5px; color: var(--text-secondary, var(--tb-text-sec)); line-height: 1.4; }
+        .cg-tb-upcoming-amount { font-size: 16px; font-weight: 600; color: var(--text-primary, var(--tb-text)); line-height: 1.4; font-variant-numeric: tabular-nums; }
+        .cg-tb-card-desc { margin: 0; font-size: 12.5px; color: var(--text-secondary, var(--tb-text-sec)); line-height: 1.5; }
         .cg-tb-sec-title { margin: 0 0 10px 0; font-size: 14px; font-weight: 600; color: var(--text-primary, var(--tb-text)); }
         .cg-tb-tbl-wrap { border: 1px solid var(--tb-border-subtle); border-radius: 10px; overflow-x: auto; background: var(--main-surface-primary, var(--tb-bg)); }
         .cg-tb-tbl { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; line-height: 1.4; }
@@ -5154,7 +7466,7 @@ function mountTeamBillingPanel(options) {
         try { triggerBtn.ariaControlsElements = [dialog]; } catch (_) {}
     }
 
-    // 坐标判断确保仅在点击背景遮罩区（而非内层白底/边距）时关闭
+    // 坐标判断确保仅在点击背景遮罩区（而非内层卡片/边距）时关闭
     dialog.addEventListener('click', function(e) {
         if (e.target !== dialog) return;
         var rect = dialog.getBoundingClientRect();
@@ -5200,9 +7512,19 @@ function mountTeamBillingPanel(options) {
 
     var noticeCard = el('div', 'cg-tb-card');
     var noticeHead = el('div', 'cg-tb-card-head');
-    noticeHead.appendChild(el('span', 'cg-tb-dot'));
-    noticeHead.appendChild(el('span', null, '下一期账单：暂不可用'));
+    var noticeDot = el('span', 'cg-tb-dot');
+    noticeHead.appendChild(noticeDot);
+    var noticeHeadTitle = el('span', null, '下一期账单');
+    noticeHead.appendChild(noticeHeadTitle);
     noticeCard.appendChild(noticeHead);
+
+    var upcomingRow = el('div', 'cg-tb-upcoming-row');
+    var upcomingDateEl = el('div', 'cg-tb-upcoming-date');
+    var upcomingAmountEl = el('div', 'cg-tb-upcoming-amount');
+    upcomingRow.appendChild(upcomingDateEl);
+    upcomingRow.appendChild(upcomingAmountEl);
+    noticeCard.appendChild(upcomingRow);
+
     var noticeDesc = el('p', 'cg-tb-card-desc');
     noticeCard.appendChild(noticeDesc);
     bodyEl.appendChild(noticeCard);
@@ -5278,7 +7600,7 @@ function mountTeamBillingPanel(options) {
         var buttons = document.querySelectorAll('button');
         for (var i = 0; i < buttons.length; i++) {
             var b = buttons[i];
-            if (b === triggerBtn || btnHost.contains(b) || panelHost.contains(b)) continue;
+            if (b === triggerBtn || btnHost.contains(b) || panelHost.contains(b) || b.hasAttribute('data-team-billing-trigger')) continue;
             if (b.closest('nav, aside, table, article, dialog, [role="dialog"]')) continue;
             if (!isElementVisible(b)) continue;
 
@@ -5315,10 +7637,16 @@ function mountTeamBillingPanel(options) {
             if (isOpen) closeDialog(false);
             return;
         }
+
+        // 同步原生按钮的 className，保证原生一致的悬停态、间距与圆角
+        if (anchor.manageButton.className && triggerBtn.className !== anchor.manageButton.className) {
+            triggerBtn.className = anchor.manageButton.className;
+        }
+
         if (anchor.manageButton.previousElementSibling !== btnHost) {
             anchor.container.insertBefore(btnHost, anchor.manageButton);
         }
-        btnHost.style.display = '';
+        btnHost.style.display = 'inline-flex';
         triggerBtn.hidden = false;
     }
 
@@ -5389,8 +7717,42 @@ function mountTeamBillingPanel(options) {
 
     function render(force) {
         var st = currentSnapshot.status || 'idle';
-        titleEl.textContent = (st === 'loading') ? '正在查询…' : '下月账单查询';
-        noticeDesc.textContent = currentSnapshot.notice || '当前接口只返回已有发票，未提供下一期账单预估。以下为最近历史记录，可前往官方账单管理页查看。';
+        titleEl.textContent = (st === 'loading') ? '正在读取官方下期账单…' : '下月账单查询';
+
+        // 状态指示灯与主卡片内容更新
+        noticeDot.className = 'cg-tb-dot';
+
+        if (st === 'loading') {
+            noticeHeadTitle.textContent = '正在读取官方下期账单…';
+            noticeDot.classList.add('blue');
+            upcomingRow.style.display = 'none';
+            upcomingDateEl.textContent = '';
+            upcomingAmountEl.textContent = '';
+            noticeDesc.textContent = currentSnapshot.notice || '将打开官方账单页，只读取下次日期和预计金额。';
+        } else if (currentSnapshot.upcomingAvailable === true && (currentSnapshot.upcomingDateText || currentSnapshot.upcomingAmountText)) {
+            noticeHeadTitle.textContent = '下一期账单';
+            noticeDot.classList.add('green');
+            upcomingRow.style.display = 'flex';
+            upcomingDateEl.textContent = currentSnapshot.upcomingDateText || '';
+            upcomingAmountEl.textContent = currentSnapshot.upcomingAmountText || '';
+            upcomingDateEl.style.display = currentSnapshot.upcomingDateText ? '' : 'none';
+            upcomingAmountEl.style.display = currentSnapshot.upcomingAmountText ? '' : 'none';
+            noticeDesc.textContent = currentSnapshot.notice || (currentSnapshot.source === 'official-page' ? '来自本次打开的官方账单页；预计金额可能变化' : '预计金额可能随席位调整变化。');
+        } else if (st === 'error') {
+            noticeHeadTitle.textContent = '暂未读取到下期账单';
+            noticeDot.classList.add('amber');
+            upcomingRow.style.display = 'none';
+            upcomingDateEl.textContent = '';
+            upcomingAmountEl.textContent = '';
+            noticeDesc.textContent = currentSnapshot.notice || currentSnapshot.error || '未能读取到下期账单信息。';
+        } else {
+            noticeHeadTitle.textContent = '暂未读取到下期账单';
+            noticeDot.classList.add('gray');
+            upcomingRow.style.display = 'none';
+            upcomingDateEl.textContent = '';
+            upcomingAmountEl.textContent = '';
+            noticeDesc.textContent = currentSnapshot.notice || '当前未读取到官方下期账单预估信息。可前往官方账单管理页查看。';
+        }
 
         var safeManageUrl = validateManageUrl(currentSnapshot.manageUrl, currentAccountId);
         if (safeManageUrl) {
@@ -5403,14 +7765,14 @@ function mountTeamBillingPanel(options) {
 
         footInfo.textContent = currentSnapshot.updatedAt ? ('更新于 ' + formatDate(currentSnapshot.updatedAt)) : '';
 
-        var sig = st + '|' + (currentSnapshot.updatedAt || '') + '|' + (currentSnapshot.history ? currentSnapshot.history.length : 0) + '|' + (currentSnapshot.error || '') + '|' + (currentSnapshot.hasMore ? 1 : 0);
+        var sig = st + '|' + (currentSnapshot.updatedAt || '') + '|' + (currentSnapshot.history ? currentSnapshot.history.length : 0) + '|' + (currentSnapshot.error || '') + '|' + (currentSnapshot.hasMore ? 1 : 0) + '|' + (currentSnapshot.upcomingAvailable ? 1 : 0) + '|' + (currentSnapshot.upcomingDateText || '') + '|' + (currentSnapshot.upcomingAmountText || '');
         if (!force && sig === lastRenderSig) return;
         lastRenderSig = sig;
 
         while (stateContainer.firstChild) stateContainer.removeChild(stateContainer.firstChild);
 
         if (st === 'loading') {
-            var loadingBox = el('div', 'cg-tb-state', '正在查询账单与发票信息…');
+            var loadingBox = el('div', 'cg-tb-state', '正在读取官方账单与历史记录…');
             loadingBox.setAttribute('role', 'status');
             loadingBox.setAttribute('aria-live', 'polite');
             stateContainer.appendChild(loadingBox);
@@ -5420,12 +7782,24 @@ function mountTeamBillingPanel(options) {
             errorBox.appendChild(el('span', null, currentSnapshot.error || '获取账单信息失败，请稍后重试'));
             var retryBtn = el('button', 'cg-tb-act-btn sec', '重试');
             retryBtn.type = 'button';
-            retryBtn.addEventListener('click', function() { loadData(); });
+            retryBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                loadData();
+            });
             errorBox.appendChild(retryBtn);
+
+            if (safeManageUrl) {
+                var errLink = el('a', 'cg-tb-act-btn pri', '前往官方账单管理 ↗');
+                errLink.href = safeManageUrl;
+                errLink.target = '_blank';
+                errLink.rel = 'noopener noreferrer';
+                errLink.style.marginTop = '8px';
+                errorBox.appendChild(errLink);
+            }
             stateContainer.appendChild(errorBox);
         } else {
             var historySec = el('div');
-            historySec.appendChild(el('h3', 'cg-tb-sec-title', '最近历史发票'));
+            historySec.appendChild(el('h3', 'cg-tb-sec-title', '历史发票'));
 
             var items = Array.isArray(currentSnapshot.history) ? currentSnapshot.history : [];
             if (items.length === 0) {
@@ -5536,12 +7910,27 @@ function mountTeamBillingPanel(options) {
         var gen = ++queryGeneration;
         isLoading = true;
         currentSnapshot.status = 'loading';
-        render();
+        render(true);
 
-        Promise.resolve().then(function() {
+        var loadResult;
+        try {
+            // 同步直接调用 options.onLoad()，确保在当前用户点击手势内立即唤起弹窗预约桥接，不经任何 await/microtask/rAF
+            loadResult = options.onLoad();
+        } catch (err) {
             if (destroyed || !isOpen || gen !== queryGeneration) return;
-            return options.onLoad();
-        }).then(function(res) {
+            isLoading = false;
+            currentSnapshot.status = 'error';
+            currentSnapshot.error = (err && err.message) ? err.message : '获取账单信息失败，请稍后重试';
+            render(true);
+            return;
+        }
+
+        // 若同步执行中发生工作区切换导致弹窗关闭，立即中止
+        if (destroyed || !isOpen || gen !== queryGeneration) {
+            return;
+        }
+
+        Promise.resolve(loadResult).then(function(res) {
             if (destroyed || !isOpen || gen !== queryGeneration) return;
             isLoading = false;
             if (typeof options.getSnapshot === 'function') {
@@ -5556,14 +7945,14 @@ function mountTeamBillingPanel(options) {
             if (res && typeof res === 'object') {
                 applySnapshot(res);
             } else {
-                render();
+                render(true);
             }
-        }).catch(function() {
+        }).catch(function(err) {
             if (destroyed || !isOpen || gen !== queryGeneration) return;
             isLoading = false;
             currentSnapshot.status = 'error';
-            currentSnapshot.error = '获取账单信息失败，请稍后重试';
-            render();
+            currentSnapshot.error = (err && err.message) ? err.message : '获取账单信息失败，请稍后重试';
+            render(true);
         });
     }
 
@@ -5632,74 +8021,243 @@ function mountTeamBillingPanel(options) {
     };
 }
 
-let view = null;
-let usageView = null;
-let billingView = null;
-let usageController = null;
-let billingController = null;
-const monitor = createSeatHistoryMonitor(snapshot => {
-    if (view) view.update(snapshot);
-});
-let mounted = false;
-function mountWhenReady() {
-    if (mounted || !document.body) return;
-    mounted = true;
 
-    try {
-        startNoticeHiding();
-    } catch (_) {
-        console.warn('[Team 助手] 用量提醒隐藏初始化失败');
-    }
+function runOfficialBillingReader() {
+  var PAY_ORIGIN = 'https://pay.openai.com';
+  var PARENT_ORIGINS = { 'https://chatgpt.com': true, 'https://chat.openai.com': true };
+  var CHANNEL = 'chatgpt-scripts:official-billing';
+  var VERSION = 1;
+  var DATE_PREFIXES = ['您的下一个账单日期是', '您的下一個帳單日期是', '您的下個帳單日期是', 'Your next invoice date', 'Your next bill date'];
+  var AMOUNT_PREFIXES = ['您的下一笔付款预计为', '您的下一筆付款預計為', '您的下筆付款預計為', 'Your next payment is estimated', 'Your next payment'];
+  var doc = document;
+  var parentWindow = null;
+  var parentOrigin = null;
+  var nonce = null;
+  var observer = null;
+  var idleTimer = null;
+  var deadlineTimer = null;
+  var debounceTimer = null;
+  var stableTimer = null;
+  var destroyed = false;
+  var lastCandidate = null;
 
-    try {
-        view = mountSeatHistoryPanel({
-            getSnapshot: monitor.getSnapshot,
-            onClearCurrent: monitor.clearCurrentHistory
-        });
-        view.update(monitor.getSnapshot());
-    } catch (_) {
-        console.warn('[Team 助手] 席位历史初始化失败');
-    }
+  if (location.origin !== PAY_ORIGIN || window.top !== window || !window.opener) return function () {};
 
-    try {
-        usageController = createTeamUsageController(snapshot => {
-            if (usageView) usageView.update(snapshot);
-        });
-        usageView = mountTeamUsagePanel({
-            getSnapshot: usageController.getSnapshot,
-            onLoad: usageController.load,
-            onSetView: usageController.setViewMode,
-            onCancel: usageController.cancel,
-            onExport: usageController.buildExport
-        });
-        usageView.update(usageController.getSnapshot());
-    } catch (_) {
-        if (usageController) usageController.destroy();
-        usageController = null;
-        usageView = null;
-        console.warn('[Team 助手] 用量统计初始化失败');
-    }
+  function isObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
 
-    try {
-        billingController = createTeamBillingController(snapshot => {
-            if (billingView) billingView.update(snapshot);
-        });
-        billingView = mountTeamBillingPanel({
-            getSnapshot: billingController.getSnapshot,
-            onLoad: billingController.load,
-            onCancel: billingController.cancel
-        });
-        billingView.update(billingController.getSnapshot());
-    } catch (_) {
-        if (billingController) billingController.destroy();
-        billingController = null;
-        billingView = null;
-        console.warn('[Team 助手] 历史账单初始化失败');
+  function validNonce(value) {
+    return typeof value === 'string' && /^[a-f0-9]{32,128}$/i.test(value);
+  }
+
+  function clearTimers() {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    if (debounceTimer) clearTimeout(debounceTimer);
+    if (stableTimer) clearTimeout(stableTimer);
+    idleTimer = deadlineTimer = debounceTimer = stableTimer = null;
+  }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    clearTimers();
+    window.removeEventListener('message', onMessage);
+    window.removeEventListener('click', onUserChange, true);
+    window.removeEventListener('change', onUserChange, true);
+    window.removeEventListener('hashchange', onNavigation);
+    window.removeEventListener('popstate', onNavigation);
+    window.removeEventListener('pagehide', onNavigation);
+    if (observer) observer.disconnect();
+    observer = null;
+    parentWindow = parentOrigin = nonce = null;
+  }
+
+  function send(type, fields) {
+    if (destroyed || !parentWindow || !parentOrigin || !nonce) return;
+    var message = { channel: CHANNEL, v: VERSION, type: type, nonce: nonce };
+    if (fields) {
+      if (fields.dateText) message.dateText = fields.dateText;
+      if (fields.amountText) message.amountText = fields.amountText;
     }
+    try { parentWindow.postMessage(message, parentOrigin); } catch (ignored) {}
+  }
+
+  function fail() {
+    send('error');
+    destroy();
+  }
+
+  function forbiddenElement(element) {
+    for (var current = element; current && current.nodeType === 1; current = current.parentElement) {
+      var tag = current.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE' || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'OPTION' || current.isContentEditable) return true;
+      if (current.getAttribute('aria-hidden') === 'true' || current.hidden) return true;
+      var style = window.getComputedStyle(current);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return true;
+    }
+    return false;
+  }
+
+  function visibleShortText(element, prefixes) {
+    if (!element || forbiddenElement(element) || !element.getClientRects().length) return null;
+    var text = (element.textContent || '').trim();
+    if (!text || text.length > 200 || !/\d/.test(text)) return null;
+    for (var index = 0; index < prefixes.length; index += 1) {
+      if (text.slice(0, prefixes[index].length).toLowerCase() === prefixes[index].toLowerCase()) return text;
+    }
+    return null;
+  }
+
+  function collect(prefixes) {
+    var matches = [];
+    var elements = doc.querySelectorAll('span, p');
+    for (var index = 0; index < elements.length; index += 1) {
+      var text = visibleShortText(elements[index], prefixes);
+      if (text) matches.push({ element: elements[index], text: text });
+    }
+    return matches.filter(function (candidate, index) {
+      for (var otherIndex = 0; otherIndex < matches.length; otherIndex += 1) {
+        if (otherIndex !== index && matches[otherIndex].text === candidate.text && candidate.element.contains(matches[otherIndex].element)) return false;
+      }
+      return true;
+    });
+  }
+
+  function sectionCandidate(dateElement, amountElement) {
+    var dates = [];
+    var current = dateElement;
+    var depth;
+    for (depth = 0; current && depth <= 10; depth += 1, current = current.parentElement) dates.push(current);
+    current = amountElement;
+    for (depth = 0; current && depth <= 10; depth += 1, current = current.parentElement) {
+      if (dates.indexOf(current) === -1) continue;
+      if (current.tagName !== 'DIV') return null;
+      var tag = current.tagName.toLowerCase();
+      var identity = (current.id + ' ' + current.className).toLowerCase();
+      if (tag === 'body' || tag === 'html' || tag === 'main' || tag === 'dialog' || current.getAttribute('role') === 'main' || /(^|\s)(app|root)(\s|$)/.test(identity)) return null;
+      if (!/(^|\s)Box-root(\s|$)/.test(current.className) || !/(^|\s)Flex-direction--column(\s|$)/.test(current.className)) return null;
+      if (forbiddenElement(current) || !current.getClientRects().length) return null;
+      var length = (current.textContent || '').trim().length;
+      if (length > 0 && length <= 1000) return current;
+    }
+    return null;
+  }
+
+  function readCandidate() {
+    var dates = collect(DATE_PREFIXES);
+    var amounts = collect(AMOUNT_PREFIXES);
+    if (dates.length !== 1 || amounts.length !== 1) return null;
+    var section = sectionCandidate(dates[0].element, amounts[0].element);
+    if (!section) return null;
+    return { dateText: dates[0].text, amountText: amounts[0].text, section: section };
+  }
+
+  function sameCandidate(left, right) {
+    return left && right && left.dateText === right.dateText && left.amountText === right.amountText && left.section === right.section;
+  }
+
+  function scheduleScan() {
+    if (destroyed || debounceTimer || stableTimer) return;
+    debounceTimer = setTimeout(function () {
+      debounceTimer = null;
+      scan();
+    }, 100);
+  }
+
+  function scan() {
+    if (destroyed || !parentWindow) return;
+    var candidate;
+    try { candidate = readCandidate(); } catch (ignored) { return fail(); }
+    if (!candidate) {
+      lastCandidate = null;
+      return;
+    }
+    if (!lastCandidate) {
+      lastCandidate = candidate;
+      stableTimer = setTimeout(function () {
+        stableTimer = null;
+        scan();
+      }, 200);
+      return;
+    }
+    if (sameCandidate(lastCandidate, candidate)) {
+      send('result', candidate);
+      destroy();
+    } else {
+      lastCandidate = candidate;
+      stableTimer = setTimeout(function () {
+        stableTimer = null;
+        scan();
+      }, 200);
+    }
+  }
+
+  function onMutation() {
+    lastCandidate = null;
+    if (stableTimer) {
+      clearTimeout(stableTimer);
+      stableTimer = null;
+    }
+    scheduleScan();
+  }
+
+  function onUserChange(event) {
+    if (parentWindow && event.isTrusted) fail();
+  }
+
+  function onNavigation() {
+    if (parentWindow) fail();
+  }
+
+  function beginCapture() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+    deadlineTimer = setTimeout(fail, 60000);
+    window.addEventListener('click', onUserChange, true);
+    window.addEventListener('change', onUserChange, true);
+    window.addEventListener('hashchange', onNavigation);
+    window.addEventListener('popstate', onNavigation);
+    window.addEventListener('pagehide', onNavigation);
+    observer = new MutationObserver(onMutation);
+    observer.observe(doc.documentElement, { childList: true, subtree: true, characterData: true });
+    scan();
+  }
+
+  function onMessage(event) {
+    var data = event.data;
+    if (destroyed || !isObject(data) || data.channel !== CHANNEL || data.v !== VERSION || !validNonce(data.nonce)) return;
+    if (!parentWindow) {
+      if (data.type !== 'hello') return;
+      if (!PARENT_ORIGINS[event.origin] || event.source !== window.opener) return;
+      parentWindow = event.source;
+      parentOrigin = event.origin;
+      nonce = data.nonce;
+      send('ack');
+      beginCapture();
+    } else if (event.origin === parentOrigin && event.source === parentWindow && data.nonce === nonce) {
+      if (data.type === 'hello') send('ack');
+      else if (data.type === 'cancel') destroy();
+    }
+  }
+
+  window.addEventListener('message', onMessage);
+  idleTimer = setTimeout(destroy, 90000);
+  return destroy;
 }
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', mountWhenReady, { once: true });
-} else {
-    mountWhenReady();
+
+let view=null,seatToast=null,lastSeatAccountId=null,usageView=null,billingView=null,usageController=null,billingController=null;
+const monitor=createSeatHistoryMonitor(snapshot=>{if(seatToast&&snapshot.accountId!==lastSeatAccountId)seatToast.clear();lastSeatAccountId=snapshot.accountId;if(view)view.update(snapshot);},event=>{if(seatToast)seatToast.show(event);});
+let mounted=false;
+function mountWhenReady(){
+  if(mounted||!document.body)return;
+  mounted=true;
+  try { startNoticeHiding(); } catch { console.warn('[Team Assistant] Notice hiding unavailable.'); }
+  try { seatToast=mountSeatPolicyToast({getAccountId:()=>monitor.getSnapshot().accountId}); } catch { console.warn('[Team Assistant] Seat policy toast unavailable.'); }
+  try { view=mountSeatHistoryPanel({getSnapshot:monitor.getSnapshot,onClearCurrent:monitor.clearCurrentHistory});view.update(monitor.getSnapshot()); } catch { console.warn('[Team Assistant] Seat history panel unavailable.'); }
+  try { usageController=createTeamUsageController(s=>{if(usageView)usageView.update(s)});usageView=mountTeamUsagePanel({getSnapshot:usageController.getSnapshot,onLoad:usageController.load,onSetView:usageController.setViewMode,onCancel:usageController.cancel,onExport:usageController.buildExport});usageView.update(usageController.getSnapshot()); } catch { try { if(usageController)usageController.destroy(); } catch {} usageController=null;usageView=null;console.warn('[Team Assistant] Usage panel unavailable.'); }
+  try { billingController=createTeamBillingController(s=>{if(billingView)billingView.update(s)});billingView=mountTeamBillingPanel({getSnapshot:billingController.getSnapshot,onLoad:billingController.load,onCancel:billingController.cancel});billingView.update(billingController.getSnapshot()); } catch { try { if(billingController)billingController.destroy(); } catch {} billingController=null;billingView=null;console.warn('[Team Assistant] Billing panel unavailable.'); }
 }
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mountWhenReady,{once:true});else mountWhenReady();
 })();
