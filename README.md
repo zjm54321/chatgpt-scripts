@@ -2,7 +2,7 @@
 
 适用于 ChatGPT 网页端的独立用户脚本集合。每个脚本均位于 `scripts/` 目录下，独立运行，无需 Node.js、构建打包或安装任何依赖。
 
-当前版本：`v2026.09.08-1`
+当前版本：`v2026.10.03-3`
 
 ## 脚本列表
 
@@ -48,7 +48,7 @@
   - 支持用户主动点击导出所显示的汇总数据 CSV/JSON（不包含访问令牌、原始响应或成员信息）。接口受限或缺失项显示为「—」；统计可能存在延迟。
 - **模型费用估算与官方定价参考**：
   - 统计费用基于内置单价估算，标明为估算值，不作为官方实际扣费凭据。
-  - `gpt-6-astra` 模型单价已核对官方文档（2026-09-08 参考 [模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra) 与 [定价页](https://developers.openai.com/api/docs/pricing)），标准短上下文费率为输入 $10、缓存输入 $1、输出 $50、缓存写入 $12.50 每百万 Token（Fast 模式为 2 倍）；长上下文在单次请求输入超过 272,000 Token 时，全请求输入/缓存/缓存写入按 2 倍、输出按 1.5 倍计费。日级汇总数据无法分辨单次请求的长上下文与缓存写入，实际统计仍按标准短上下文（$10/$1/$50）及 Fast 2 倍单价进行参考估算；其他模型沿用用户提供的参考配置表。
+  - **Codex / ChatGPT Work 价格表已按 2026-10-03 官方费率表更新**：支持 GPT-6 Astra、GPT-6.1 Sol、GPT-6 Sol、GPT-6 Luna、GPT-5.6 Sol/Terra/Luna、GPT-Rosalind-Research、GPT-5.5、Daybreak Blue/Red、GPT-5.3-Codex、GPT-5.2、GPT-6 Astra Law；GPT-5.4/5.4-mini 保留用于历史用量兼容。GPT-5.3-Codex-Spark 仍为 Research preview、无最终 Token 单价，因此会显示为“已识别但不估价”。Auto Review 映射 GPT-5.6 Luna，Code Review 映射 GPT-5.3-Codex。支持 Fast 的现行 GPT-6 / GPT-5.6 / GPT-5.5 按官方 2× Token 费率计算；Codex 不计 cache write，GPT-6 Astra 在 Codex 中不应用 >272K 输入的长上下文额外倍率。GPT-5.6 Sol 当前 $4/$0.40/$20（输入/缓存输入/输出，每百万 Token）的优惠价官方注明至少持续至 2026-11-21。参考 [ChatGPT Rate Card](https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing)。
 - **网络、存储与隐私**：
   - 横幅隐藏为纯 DOM 操作；席位历史为纯被动监听，仅使用 `_account` Cookie 识别当前空间，不读取登录凭据。沿用旧版席位监控的本地记录；清理网站数据会删除这些记录，共用浏览器时请注意留存的邮箱信息。
   - 账单与用量统计仅在用户主动操作时发起只读 GET 请求，或与本次打开的官方账单窗口进行单次通信；不会上传本地历史到第三方服务。访问令牌与临时统计结果保留在临时内存中，检测到空间切换后清除；席位历史和邮箱索引保存在本机。支持 Web Locks 协调多标签页写入。

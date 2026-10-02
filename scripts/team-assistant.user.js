@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Team 助手
 // @namespace    https://github.com/zjm54321/chatgpt-scripts
-// @version      v2026.09.08-1
+// @version      v2026.10.03-3
 // @description  官方下期账单读取、用量额度统计与席位历史提醒；不修改额度或计费设置。
 // @author       zjm54321
 // @match        https://chatgpt.com/*
@@ -2179,16 +2179,45 @@ function createTeamUsageController(onChange) {
   var syncingAccount = false;
   var accountWatch = null;
 
-  /* User-supplied reference rates in USD per 1M tokens, except Astra's confirmed standard rates (2026-09-08). */
+  /*
+   * ChatGPT Work / Codex reference rates in USD per 1M tokens.
+   * Source: https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing
+   * Updated 2026-10-03. The fourth value is the Fast-mode multiplier when Work/Codex supports Fast.
+   * Codex does not charge cache writes. Request-level long-context/regional add-ons cannot be fully inferred
+   * from the daily aggregate payload. GPT-5.4/5.4-mini are retained for historical usage compatibility.
+   */
   var REFERENCE_RATES = {
-    'gpt-5.6-sol': [5, 0.5, 30, 2.5],
-    'gpt-5.6-terra': [2, 0.2, 12, 2.5],
-    'gpt-5.6-luna': [0.2, 0.02, 1.2, 2.5],
-    'gpt-5.5': [5, 0.5, 30, 2.5],
+    'gpt-6-astra': [10, 1, 50, 2],
+    'gpt-6.1-sol': [2, 0.1, 10, 2],
+    'gpt-6-sol': [2, 0.2, 10, 2],
+    'gpt-6-luna': [0.1, 0.01, 0.5, 2],
+    'gpt-5.6-sol': [4, 0.4, 20, 2],
+    'gpt-5.6-terra': [2, 0.2, 12, 2],
+    'gpt-5.6-luna': [0.2, 0.02, 1.2, 2],
+    'gpt-rosalind-research': [5, 0.5, 25, 1],
+    'gpt-5.5': [5, 0.5, 30, 2],
+    'gpt-5.6-cyber': [12.5, 1.25, 75, 1],
+    'gpt-5.3-codex': [1.75, 0.175, 14, 1],
+    'gpt-5.2': [1.75, 0.175, 14, 1],
+    'gpt-6-astra-law': [12.5, 1.25, 62.5, 1],
+
+    // Historical Work/Codex entries kept so older usage rows do not fall back to gpt-5.5.
     'gpt-5.4': [2.5, 0.25, 15, 2],
-    'gpt-5.4-mini': [0.75, 0.075, 4.5, 2],
-    // Official: https://developers.openai.com/api/docs/models/gpt-6-astra (2026-09-08).
-    'gpt-6-astra': [10, 1, 50, 2]
+    'gpt-5.4-mini': [0.75, 0.075, 4.5, 2]
+  };
+  var MODEL_RATE_ALIASES = {
+    'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
+    'daybreak-blue': 'gpt-5.6-sol',
+    'daybreak_blue': 'gpt-5.6-sol',
+    'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
+    'daybreak-red': 'gpt-5.6-cyber',
+    'daybreak_red': 'gpt-5.6-cyber',
+    'gpt-5.2-codex': 'gpt-5.2',
+    'codex-code-review': 'gpt-5.3-codex',
+    'codex-auto-review': 'gpt-5.6-luna'
+  };
+  var UNPRICED_MODELS = {
+    'gpt-5.3-codex-spark': true
   };
   var TOKEN_KEYS = [
     'text_total_tokens', 'total_text_tokens', 'uncached_text_input_tokens',
@@ -2731,7 +2760,7 @@ function createTeamUsageController(onChange) {
   }
 
   function pricingSpeed(name, speed) {
-    return name.toLowerCase() === 'gpt-6-astra' && speed === 'priority' ? 'fast' : speed;
+    return speed === 'priority' ? 'fast' : speed;
   }
 
   function hasTokenFields(raw) {
@@ -2803,17 +2832,34 @@ function createTeamUsageController(onChange) {
 
   function priceFor(name, speed) {
     var key = name.toLowerCase();
-    speed = key === 'gpt-6-astra' && speed === 'priority' ? 'fast' : speed;
-    if (key === 'codex-auto-review') key = 'gpt-5.6-luna';
-    if (key === 'gpt-image-2' || key === 'image2') return { image: true, family: key, fallback: false, multiplier: 1 };
-    if (Object.prototype.hasOwnProperty.call(REFERENCE_RATES, key)) {
-      return { image: false, family: key, fallback: false, multiplier: speed === 'fast' ? REFERENCE_RATES[key][3] : 1 };
+    speed = speed === 'priority' ? 'fast' : speed;
+    if (Object.prototype.hasOwnProperty.call(MODEL_RATE_ALIASES, key)) key = MODEL_RATE_ALIASES[key];
+    if (key === 'gpt-image-2' || key === 'gpt-image-2.0' || key === 'image2') {
+      return { image: true, family: key, fallback: false, unpriced: false, multiplier: 1 };
     }
-    return { image: false, family: 'gpt-5.5', fallback: true, multiplier: speed === 'fast' ? REFERENCE_RATES['gpt-5.5'][3] : 1 };
+    if (Object.prototype.hasOwnProperty.call(UNPRICED_MODELS, key)) {
+      return { image: false, family: key, fallback: false, unpriced: true, multiplier: 1 };
+    }
+    if (Object.prototype.hasOwnProperty.call(REFERENCE_RATES, key)) {
+      return {
+        image: false,
+        family: key,
+        fallback: false,
+        unpriced: false,
+        multiplier: speed === 'fast' ? REFERENCE_RATES[key][3] : 1
+      };
+    }
+    return {
+      image: false,
+      family: 'gpt-5.5',
+      fallback: true,
+      unpriced: false,
+      multiplier: speed === 'fast' ? REFERENCE_RATES['gpt-5.5'][3] : 1
+    };
   }
 
   function moneyFor(metrics, pricing) {
-    if (metrics.invalid) return null;
+    if (pricing.unpriced || metrics.invalid) return null;
     if (pricing.image) {
       if (metrics.incompleteImage || metrics.imageUncached === null || metrics.imageCached === null ||
           metrics.imageOutput === null || (metrics.textUncached === null) !== (metrics.textCached === null)) return null;
@@ -2827,7 +2873,12 @@ function createTeamUsageController(onChange) {
   }
 
   function calculationFor(metrics, pricing, estimated) {
-    if (estimated === null) return metrics.hasImage ? '图像或文本令牌明细不完整，未估算费用' : '文本令牌明细不完整，未估算费用';
+    if (pricing.unpriced) {
+      return pricing.family + ' 当前为 Research preview，官方尚未公布最终 Token 单价，未估算费用';
+    }
+    if (estimated === null) {
+      return metrics.hasImage ? '图像或文本令牌明细不完整，未估算费用' : '文本令牌明细不完整，未估算费用';
+    }
     if (pricing.image) {
       var text = metrics.textUncached === null ? '' : '文本：输入=' + metrics.textUncached + '×$5/M，缓存=' +
         metrics.textCached + '×$1.25/M；';
@@ -2835,14 +2886,13 @@ function createTeamUsageController(onChange) {
         metrics.imageOutput + '×$30/M；按参考费率估算，非实际账单';
     }
     var rate = REFERENCE_RATES[pricing.family];
-    if (pricing.family === 'gpt-6-astra') {
-      return '文本：输入=' + metrics.textUncached + '×$10/M，缓存=' + metrics.textCached + '×$1/M，输出=' +
-        metrics.textOutput + '×$50/M；GPT-6 Astra 官网标准短上下文费率，快速×2（如适用）；超过 272000 输入的长上下文及 $12.50/M 缓存写入未分列，实际费用可能不同。';
-    }
+    var note = pricing.family === 'gpt-6-astra'
+      ? '；Codex 中 Astra 不计缓存写入，且 >272K 输入不加收长上下文倍率'
+      : '；长上下文、区域处理等请求级附加费未分列';
     return '文本：输入=' + metrics.textUncached + '×$' + rate[0] + '/M，缓存=' + metrics.textCached + '×$' +
       rate[1] + '/M，输出=' + metrics.textOutput + '×$' + rate[2] + '/M；' + pricing.family +
-      (pricing.multiplier !== 1 ? '，快速×' + pricing.multiplier : '') +
-      (pricing.fallback ? '（未知模型回退）' : '') + '；按参考费率估算，非实际账单';
+      (pricing.multiplier !== 1 ? '，Fast×' + pricing.multiplier : '') +
+      (pricing.fallback ? '（未知模型回退）' : '') + note + '；按 ChatGPT Work/Codex 参考费率估算，非实际账单';
   }
 
   function tokenModel(raw, notices) {
@@ -2850,13 +2900,21 @@ function createTeamUsageController(onChange) {
     var speed = pricingSpeed(name, safeSpeed(raw));
     var pricing = priceFor(name, speed);
     var metrics = rawMetrics(raw, pricing.image);
-    if (pricing.family === 'gpt-6-astra') {
-      addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
+    if (pricing.unpriced) {
+      addNotice(notices, name + ' 为 Research preview，官方尚未公布最终 Token 单价，费用不做估算。');
     }
-    if (name.toLowerCase() === 'codex-auto-review') addNotice(notices, 'codex-auto-review 按用户指定映射为 gpt-5.6-luna。');
+    if (pricing.family === 'gpt-6-astra') {
+      addNotice(notices, 'GPT-6 Astra 在 Codex 中不收缓存写入费用，且不应用 >272K 输入的长上下文额外倍率。');
+    }
+    if (name.toLowerCase() === 'codex-auto-review') {
+      addNotice(notices, 'codex-auto-review 按官方当前 Auto Review 模型映射为 gpt-5.6-luna。');
+    }
+    if (name.toLowerCase() === 'codex-code-review') {
+      addNotice(notices, 'codex-code-review 按官方当前 Code Review 模型映射为 gpt-5.3-codex。');
+    }
     if (pricing.fallback) addNotice(notices, '未知文本模型按 gpt-5.5 参考费率显示，非实际账单。');
     var estimated = moneyFor(metrics, pricing);
-    if (estimated !== null) addNotice(notices, '费用按参考费率估算，非实际账单。');
+    if (estimated !== null) addNotice(notices, '费用按 ChatGPT Work/Codex 参考费率估算，非实际账单。');
     return {
       name: name, speed: speed, tokens: metrics.tokens,
       uncachedInputTokens: metrics.uncachedInputTokens, cachedInputTokens: metrics.cachedInputTokens,
@@ -2917,9 +2975,6 @@ function createTeamUsageController(onChange) {
     var tokens = [];
     var activities = [];
     rawModelValues(row).forEach(function (raw) {
-      if (safeModelName(raw).toLowerCase() === 'gpt-6-astra') {
-        addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
-      }
       if (hasTokenFields(raw)) tokens.push(tokenModel(raw, notices));
       var activity = activityRow(raw);
       if (activity) activities.push(activity);
@@ -3052,18 +3107,24 @@ function createTeamUsageController(onChange) {
     };
     var estimate = moneyFor(metrics, pricing);
     if (pricing.family === 'gpt-6-astra') {
-      addNotice(notices, 'GPT-6 Astra 按官网标准短上下文费率估算；日汇总不能区分长上下文及缓存写入，实际费用可能不同。');
+      addNotice(notices, 'GPT-6 Astra 在 Codex 中不收缓存写入费用，且不应用 >272K 输入的长上下文额外倍率。');
+    }
+    if (pricing.unpriced) {
+      addNotice(notices, name + ' 为 Research preview，官方尚未公布最终 Token 单价，费用不做估算。');
     }
     if (pricing.fallback) addNotice(notices, '未知文本模型按 gpt-5.5 参考费率显示，非实际账单。');
-    if (name.toLowerCase() === 'codex-auto-review') addNotice(notices, 'codex-auto-review 按用户指定映射为 gpt-5.6-luna。');
+    if (name.toLowerCase() === 'codex-auto-review') {
+      addNotice(notices, 'codex-auto-review 按官方当前 Auto Review 模型映射为 gpt-5.6-luna。');
+    }
+    if (name.toLowerCase() === 'codex-code-review') {
+      addNotice(notices, 'codex-code-review 按官方当前 Code Review 模型映射为 gpt-5.3-codex。');
+    }
     return {
       name: name, speed: speed, tokens: uncached + cached + output,
       uncachedInputTokens: uncached, cachedInputTokens: cached, outputTokens: output,
       estimatedUsd: estimate, estimatedAllocation: true, fallbackPricing: pricing.fallback,
       incompleteImage: false,
-      calculation: pricing.family === 'gpt-6-astra'
-        ? '按积分与参考混合费率分配总令牌；' + calculationFor(metrics, pricing, estimate)
-        : '按积分与参考混合费率分配总令牌；按参考费率估算，非实际账单'
+      calculation: '按积分与参考混合费率分配总令牌；' + calculationFor(metrics, pricing, estimate)
     };
   }
 
@@ -3074,7 +3135,8 @@ function createTeamUsageController(onChange) {
     var total = day.uncachedInputTokens + day.cachedInputTokens + day.outputTokens;
     if (!(total > 0) || !isFinite(total) || total !== day.tokens) return false;
     var candidates = activities.filter(function (activity) {
-      return activity.credits !== null && activity.credits > 0 && !priceFor(activity.name, activity.speed).image;
+      var pricing = priceFor(activity.name, activity.speed);
+      return activity.credits !== null && activity.credits > 0 && !pricing.image && !pricing.unpriced;
     });
     if (!candidates.length || candidates.length !== activities.length) return false;
     var weights = candidates.map(function (activity) {
@@ -3521,6 +3583,7 @@ function createTeamUsageController(onChange) {
 
 function mountTeamUsagePanel(options = {}) {
   const CONFIG = {
+    VERSION: '2026.10.03-3',
     DAY_MS: 24 * 60 * 60 * 1000,
     MAX_RANGE_DAYS: 366,
     TARGET_WINDOW_SECONDS: 7 * 24 * 60 * 60,
@@ -5278,6 +5341,39 @@ function mountTeamUsagePanel(options = {}) {
   const getModelDisplayName = (item = {}) => String(item.model || item.model_id || item.model_name || item.name || item.id || 'unknown').trim();
   const normalizeSpeed = (value, fallback = 'standard') => String(value || fallback).trim().toLowerCase();
   const estimateModelUsd = (row = {}) => row?.estimatedUsd !== undefined ? row.estimatedUsd : null;
+  const sumModelEstimatedUsd = (rows = []) => {
+    const models = asArray(rows);
+    if (!models.length) return null;
+    let total = 0;
+    for (const model of models) {
+      const raw = model?.estimatedUsd;
+      if (raw === null || raw === undefined) return null;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return null;
+      total += value;
+    }
+    return Number.isFinite(total) ? total : null;
+  };
+  const sumDailyEstimatedUsd = (rows = []) => {
+    const days = asArray(rows);
+    if (!days.length) return null;
+    let total = 0;
+    let sawUsage = false;
+    for (const day of days) {
+      const totals = day?.totals || day;
+      const tokens = tokenTotal(totals);
+      const models = asArray(day?._tokenModels);
+      const hasUsage = (Number.isFinite(Number(tokens)) && Number(tokens) > 0) || models.length > 0;
+      if (!hasUsage) continue;
+      sawUsage = true;
+      const raw = day?._estimatedUsd;
+      if (raw === null || raw === undefined) return null;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return null;
+      total += value;
+    }
+    return sawUsage && Number.isFinite(total) ? total : null;
+  };
   const formatModelCostCalculation = (row = {}) => {
     if (row && typeof row.calculation === 'string' && row.calculation.trim()) {
       return row.calculation;
@@ -5455,6 +5551,10 @@ function mountTeamUsagePanel(options = {}) {
       const dateStr = d.date || '';
       const sortTs = dayStartMs(dateStr) || 0;
       const hasTeamTokenModels = dayModels.length > 0 && dayModels.some((m) => (m.tokens !== null && m.tokens !== undefined && Number.isFinite(Number(m.tokens))));
+      const explicitDayUsd = d.estimatedUsd !== null && d.estimatedUsd !== undefined && Number.isFinite(Number(d.estimatedUsd))
+        ? Number(d.estimatedUsd)
+        : null;
+      const dayEstimatedUsd = explicitDayUsd !== null ? explicitDayUsd : sumModelEstimatedUsd(dayModels);
 
       return {
         _sortTs: sortTs,
@@ -5462,7 +5562,7 @@ function mountTeamUsagePanel(options = {}) {
         _displayDate: dateStr,
         _tokenModels: dayModels,
         _hasTeamTokenModels: hasTeamTokenModels,
-        _estimatedUsd: d.estimatedUsd !== undefined ? d.estimatedUsd : null,
+        _estimatedUsd: dayEstimatedUsd,
         tokens: d.tokens !== undefined ? d.tokens : null,
         uncachedInputTokens: d.uncachedInputTokens !== undefined ? d.uncachedInputTokens : null,
         cachedInputTokens: d.cachedInputTokens !== undefined ? d.cachedInputTokens : null,
@@ -5478,6 +5578,13 @@ function mountTeamUsagePanel(options = {}) {
       };
     });
 
+    const explicitSummaryUsd = snapshot.summary?.estimatedUsd !== null &&
+      snapshot.summary?.estimatedUsd !== undefined &&
+      Number.isFinite(Number(snapshot.summary.estimatedUsd))
+        ? Number(snapshot.summary.estimatedUsd)
+        : null;
+    const dailyEstimatedUsd = sumDailyEstimatedUsd(dailyBreakdown);
+
     const summary = {
       tokens: snapshot.summary?.tokens !== undefined ? snapshot.summary.tokens : null,
       uncachedInputTokens: snapshot.summary?.uncachedInputTokens !== undefined ? snapshot.summary.uncachedInputTokens : null,
@@ -5486,7 +5593,7 @@ function mountTeamUsagePanel(options = {}) {
       turns: snapshot.summary?.turns !== undefined ? snapshot.summary.turns : null,
       threads: snapshot.summary?.threads !== undefined ? snapshot.summary.threads : null,
       credits: snapshot.summary?.credits !== undefined ? snapshot.summary.credits : null,
-      estimatedUsd: snapshot.summary?.estimatedUsd !== undefined ? snapshot.summary.estimatedUsd : null,
+      estimatedUsd: explicitSummaryUsd !== null ? explicitSummaryUsd : dailyEstimatedUsd,
       activeMembersPeak: snapshot.summary?.activeMembersPeak !== undefined ? snapshot.summary.activeMembersPeak : null,
       activeMemberDays: null,
     };
@@ -5981,7 +6088,7 @@ ${css}
               <div class="header-title">
                 <span class="header-icon">📊</span>
                 <span class="title-text" id="modalTitle">Codex 用量追踪</span>
-                <span class="version">2026.08.27-v1</span>
+                <span class="version">${CONFIG.VERSION}</span>
                 <span class="mode-badge" id="modeBadge"></span>
               </div>
               <div class="header-delay-pill" title="OpenAI 用量数据统计非实时，一般约有数小时延迟">
