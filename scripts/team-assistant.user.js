@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Team 助手
 // @namespace    https://github.com/zjm54321/chatgpt-scripts
-// @version      v2026.10.03-3
+// @version      v2026.10.15-1
 // @description  官方下期账单读取、用量额度统计与席位历史提醒；不修改额度或计费设置。
 // @author       zjm54321
 // @match        https://chatgpt.com/*
@@ -2248,7 +2248,7 @@ function createTeamUsageController(onChange) {
     return {
       tokens: null, uncachedInputTokens: null, cachedInputTokens: null,
       outputTokens: null, turns: null, threads: null, credits: null,
-      estimatedUsd: null, activeMembersPeak: null
+      estimatedUsd: null, knownEstimatedUsd: null, incompletePricing: false, activeMembersPeak: null
     };
   }
 
@@ -2834,7 +2834,7 @@ function createTeamUsageController(onChange) {
     var key = name.toLowerCase();
     speed = speed === 'priority' ? 'fast' : speed;
     if (Object.prototype.hasOwnProperty.call(MODEL_RATE_ALIASES, key)) key = MODEL_RATE_ALIASES[key];
-    if (key === 'gpt-image-2' || key === 'gpt-image-2.0' || key === 'image2') {
+    if (['gpt-image-2', 'gpt-image-2.0', 'image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'].indexOf(key) !== -1) {
       return { image: true, family: key, fallback: false, unpriced: false, multiplier: 1 };
     }
     if (Object.prototype.hasOwnProperty.call(UNPRICED_MODELS, key)) {
@@ -2915,6 +2915,7 @@ function createTeamUsageController(onChange) {
     if (pricing.fallback) addNotice(notices, '未知文本模型按 gpt-5.5 参考费率显示，非实际账单。');
     var estimated = moneyFor(metrics, pricing);
     if (estimated !== null) addNotice(notices, '费用按 ChatGPT Work/Codex 参考费率估算，非实际账单。');
+    if (pricing.image && estimated === null) addNotice(notices, name + ' 缺少完整图像 Token 明细；图像费用未知，其他模型的已知费用仍可显示。');
     return {
       name: name, speed: speed, tokens: metrics.tokens,
       uncachedInputTokens: metrics.uncachedInputTokens, cachedInputTokens: metrics.cachedInputTokens,
@@ -3001,6 +3002,13 @@ function createTeamUsageController(onChange) {
     return sumAll(models.map(function (model) { return model.estimatedUsd; }));
   }
 
+  function knownCostForModels(models) {
+    var values = models.map(function (model) { return model.estimatedUsd; }).filter(function (value) {
+      return typeof value === 'number' && isFinite(value);
+    });
+    return sumAll(values);
+  }
+
   function differsWhenKnown(left, right) {
     return left !== null && (right === null || left !== right);
   }
@@ -3023,12 +3031,9 @@ function createTeamUsageController(onChange) {
         differsWhenKnown(direct.cachedInputTokens, aggregateCached) ||
         differsWhenKnown(direct.outputTokens, aggregateOutput);
     }
-    var coverageIncomplete = split.coverageIncomplete || unseen;
-    if (coverageIncomplete) addNotice(notices, '模型令牌覆盖不完整；费用和模型汇总保持不可用。');
-    if (unseen) split.tokens.forEach(function (model) {
-      model.estimatedUsd = null;
-      model.calculation = '日汇总与模型令牌不一致，未汇总费用';
-    });
+    // Activity-only rows do not invalidate prices when model tokens match the day's totals.
+    var coverageIncomplete = unseen || (!direct.present && split.coverageIncomplete);
+    if (coverageIncomplete) addNotice(notices, '模型 Token 明细覆盖不完整；显示已识别模型的部分费用，未知部分不计价。');
     var day = {
       date: date,
       tokens: direct.present ? direct.tokens : aggregateTokens,
@@ -3038,7 +3043,9 @@ function createTeamUsageController(onChange) {
       turns: numberFrom(totals, ['turns', 'turn_count', 'conversation_turns']),
       threads: numberFrom(totals, ['threads', 'thread_count']),
       credits: numberFrom(totals, ['credits', 'credit_count']),
-      estimatedUsd: costForModels(split.tokens, unseen || coverageIncomplete),
+      estimatedUsd: costForModels(split.tokens, coverageIncomplete),
+      knownEstimatedUsd: knownCostForModels(split.tokens),
+      incompletePricing: coverageIncomplete || split.tokens.some(function (model) { return model.estimatedUsd === null; }),
       models: split.tokens
     };
     if (day.turns === null) day.turns = aggregateField(split.activities, 'turns');
@@ -3154,6 +3161,8 @@ function createTeamUsageController(onChange) {
       return allocatedModel(activity, uncached[index], cached[index], output[index], notices);
     });
     day.estimatedUsd = costForModels(day.models, false);
+    day.knownEstimatedUsd = knownCostForModels(day.models);
+    day.incompletePricing = day.estimatedUsd === null;
     addNotice(notices, '缺少按模型令牌明细；按积分和参考费率分配，非实际账单。');
     return true;
   }
@@ -3190,12 +3199,9 @@ function createTeamUsageController(onChange) {
         date: date, tokens: tokens, uncachedInputTokens: pick('uncachedInputTokens'),
         cachedInputTokens: pick('cachedInputTokens'), outputTokens: pick('outputTokens'),
         turns: pick('turns'), threads: pick('threads'), credits: pick('credits'),
-        estimatedUsd: costForModels(exactModels, unseen), models: exactModels.slice()
+        estimatedUsd: costForModels(exactModels, unseen),
+        knownEstimatedUsd: knownCostForModels(exactModels), models: exactModels.slice()
       };
-      if (unseen) day.models.forEach(function (model) {
-        model.estimatedUsd = null;
-        model.calculation = '日汇总与模型令牌不一致，未汇总费用';
-      });
       if (day.turns === null) day.turns = aggregateField(activities, 'turns');
       if (day.threads === null) day.threads = aggregateField(activities, 'threads');
       if (day.credits === null) day.credits = aggregateField(activities, 'credits');
@@ -3209,6 +3215,7 @@ function createTeamUsageController(onChange) {
       var coverageIncomplete = unseen || directInvalid || !!((count && count.coverageIncomplete) || (detail && detail.coverageIncomplete));
       if (allocated) coverageIncomplete = false;
       if (coverageIncomplete) day.estimatedUsd = null;
+      day.incompletePricing = day.estimatedUsd === null;
       return {
         day: day, tokenModels: day.models, activities: activities,
         clients: count && count.clients.length ? count.clients : detail ? detail.clients : [],
@@ -3233,11 +3240,13 @@ function createTeamUsageController(onChange) {
       var rows = groups[key];
       var first = rows[0];
       return {
-        name: first.name, speed: first.speed, tokens: coverageIncomplete ? null : aggregateField(rows, 'tokens'),
-        uncachedInputTokens: coverageIncomplete ? null : aggregateField(rows, 'uncachedInputTokens'),
-        cachedInputTokens: coverageIncomplete ? null : aggregateField(rows, 'cachedInputTokens'),
-        outputTokens: coverageIncomplete ? null : aggregateField(rows, 'outputTokens'),
-        estimatedUsd: coverageIncomplete ? null : sumAll(rows.map(function (row) { return row.estimatedUsd; })),
+        name: first.name, speed: first.speed, tokens: aggregateField(rows, 'tokens'),
+        uncachedInputTokens: aggregateField(rows, 'uncachedInputTokens'),
+        cachedInputTokens: aggregateField(rows, 'cachedInputTokens'),
+        outputTokens: aggregateField(rows, 'outputTokens'),
+        estimatedUsd: sumAll(rows.map(function (row) { return row.estimatedUsd; })),
+        knownEstimatedUsd: knownCostForModels(rows),
+        incompletePricing: coverageIncomplete || rows.some(function (row) { return row.estimatedUsd === null; }),
         estimatedAllocation: rows.some(function (row) { return row.estimatedAllocation; }),
         fallbackPricing: rows.some(function (row) { return row.fallbackPricing; }),
         incompleteImage: rows.some(function (row) { return row.incompleteImage; }),
@@ -3299,6 +3308,10 @@ function createTeamUsageController(onChange) {
       cachedInputTokens: aggregateField(days, 'cachedInputTokens'), outputTokens: aggregateField(days, 'outputTokens'),
       turns: aggregateField(days, 'turns'), threads: aggregateField(days, 'threads'), credits: aggregateField(days, 'credits'),
       estimatedUsd: sumAll(days.map(function (day) { return day.estimatedUsd; })),
+      knownEstimatedUsd: sumAll(days.map(function (day) { return day.knownEstimatedUsd; }).filter(function (value) {
+        return typeof value === 'number' && isFinite(value);
+      })),
+      incompletePricing: days.some(function (day) { return day.estimatedUsd === null; }),
       activeMembersPeak: maxKnown(records.map(function (record) { return record.users; }).concat(records.reduce(function (all, record) {
         return all.concat(record.activities.map(function (activity) { return activity.users; }));
       }, [])))
@@ -5337,7 +5350,7 @@ function mountTeamUsagePanel(options = {}) {
 
   const personalCycleCostEstimate = () => null;
   const isCodexAutoReviewModel = (name) => String(name || '').trim().toLowerCase() === 'codex-auto-review';
-  const isImageModel = (name) => { const m = String(name || '').trim().toLowerCase(); return m === 'gpt-image-2' || m === 'image2'; };
+  const isImageModel = (name) => { const m = String(name || '').trim().toLowerCase(); return ['gpt-image-2', 'gpt-image-2.0', 'image2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'].includes(m); };
   const getModelDisplayName = (item = {}) => String(item.model || item.model_id || item.model_name || item.name || item.id || 'unknown').trim();
   const normalizeSpeed = (value, fallback = 'standard') => String(value || fallback).trim().toLowerCase();
   const estimateModelUsd = (row = {}) => row?.estimatedUsd !== undefined ? row.estimatedUsd : null;
@@ -5353,6 +5366,11 @@ function mountTeamUsagePanel(options = {}) {
       total += value;
     }
     return Number.isFinite(total) ? total : null;
+  };
+  const sumKnownModelEstimatedUsd = (rows = []) => {
+    const values = asArray(rows).map((m) => m?.estimatedUsd)
+      .filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
+    return values.length ? values.reduce((total, value) => total + Number(value), 0) : null;
   };
   const sumDailyEstimatedUsd = (rows = []) => {
     const days = asArray(rows);
@@ -5373,6 +5391,11 @@ function mountTeamUsagePanel(options = {}) {
       total += value;
     }
     return sawUsage && Number.isFinite(total) ? total : null;
+  };
+  const sumKnownDailyEstimatedUsd = (rows = []) => {
+    const values = asArray(rows).map((d) => d?._knownEstimatedUsd)
+      .filter((value) => value !== null && value !== undefined && Number.isFinite(Number(value)));
+    return values.length ? values.reduce((total, value) => total + Number(value), 0) : null;
   };
   const formatModelCostCalculation = (row = {}) => {
     if (row && typeof row.calculation === 'string' && row.calculation.trim()) {
@@ -5554,7 +5577,11 @@ function mountTeamUsagePanel(options = {}) {
       const explicitDayUsd = d.estimatedUsd !== null && d.estimatedUsd !== undefined && Number.isFinite(Number(d.estimatedUsd))
         ? Number(d.estimatedUsd)
         : null;
-      const dayEstimatedUsd = explicitDayUsd !== null ? explicitDayUsd : sumModelEstimatedUsd(dayModels);
+      const dayEstimatedUsd = d.incompletePricing ? null :
+        (explicitDayUsd !== null ? explicitDayUsd : sumModelEstimatedUsd(dayModels));
+      const explicitKnownUsd = d.knownEstimatedUsd !== null && d.knownEstimatedUsd !== undefined &&
+        Number.isFinite(Number(d.knownEstimatedUsd)) ? Number(d.knownEstimatedUsd) : null;
+      const knownDayUsd = explicitKnownUsd !== null ? explicitKnownUsd : sumKnownModelEstimatedUsd(dayModels);
 
       return {
         _sortTs: sortTs,
@@ -5563,6 +5590,7 @@ function mountTeamUsagePanel(options = {}) {
         _tokenModels: dayModels,
         _hasTeamTokenModels: hasTeamTokenModels,
         _estimatedUsd: dayEstimatedUsd,
+        _knownEstimatedUsd: knownDayUsd,
         tokens: d.tokens !== undefined ? d.tokens : null,
         uncachedInputTokens: d.uncachedInputTokens !== undefined ? d.uncachedInputTokens : null,
         cachedInputTokens: d.cachedInputTokens !== undefined ? d.cachedInputTokens : null,
@@ -5584,6 +5612,10 @@ function mountTeamUsagePanel(options = {}) {
         ? Number(snapshot.summary.estimatedUsd)
         : null;
     const dailyEstimatedUsd = sumDailyEstimatedUsd(dailyBreakdown);
+    const explicitKnownSummaryUsd = snapshot.summary?.knownEstimatedUsd !== null &&
+      snapshot.summary?.knownEstimatedUsd !== undefined && Number.isFinite(Number(snapshot.summary.knownEstimatedUsd))
+        ? Number(snapshot.summary.knownEstimatedUsd) : null;
+    const knownSummaryUsd = explicitKnownSummaryUsd !== null ? explicitKnownSummaryUsd : sumKnownDailyEstimatedUsd(dailyBreakdown);
 
     const summary = {
       tokens: snapshot.summary?.tokens !== undefined ? snapshot.summary.tokens : null,
@@ -5593,7 +5625,10 @@ function mountTeamUsagePanel(options = {}) {
       turns: snapshot.summary?.turns !== undefined ? snapshot.summary.turns : null,
       threads: snapshot.summary?.threads !== undefined ? snapshot.summary.threads : null,
       credits: snapshot.summary?.credits !== undefined ? snapshot.summary.credits : null,
-      estimatedUsd: explicitSummaryUsd !== null ? explicitSummaryUsd : dailyEstimatedUsd,
+      estimatedUsd: snapshot.summary?.incompletePricing ? null :
+        (explicitSummaryUsd !== null ? explicitSummaryUsd : dailyEstimatedUsd),
+      knownEstimatedUsd: knownSummaryUsd,
+      incompletePricing: Boolean(snapshot.summary?.incompletePricing),
       activeMembersPeak: snapshot.summary?.activeMembersPeak !== undefined ? snapshot.summary.activeMembersPeak : null,
       activeMemberDays: null,
     };
@@ -5712,6 +5747,10 @@ function mountTeamUsagePanel(options = {}) {
         }).join('')}
       </div>`;
   };  const renderTokenCostKpis = (stats, modelStats, { isTeamView = false, currentUserSummary = null } = {}) => {
+    const fullCost = stats.estimatedUsd !== null && stats.estimatedUsd !== undefined;
+    const displayCost = fullCost ? stats.estimatedUsd : stats.knownEstimatedUsd;
+    const hasDisplayCost = displayCost !== null && displayCost !== undefined && Number.isFinite(Number(displayCost));
+    const partialCost = !fullCost && hasDisplayCost;
     const tokenCard = `
       <section class="summary-card">
         <div class="card-header-row">
@@ -5730,7 +5769,8 @@ function mountTeamUsagePanel(options = {}) {
           <span class="card-label">${isTeamView ? '团队预估费用' : '预估费用'}</span>
           <span class="card-badge cost">预估</span>
         </div>
-        <div class="card-value cost-value">${modelStats.rows.length ? fmtUsd(isTeamView ? stats.estimatedUsd : stats.estimatedUsd) : '不可用'}</div>
+        <div class="card-value cost-value">${modelStats.rows.length && hasDisplayCost ? fmtUsd(displayCost) : '不可用'}</div>
+        ${partialCost ? '<div class="card-sub">仅已识别模型的预估费用；未包含无 Token 明细的图像及其他未知用量。</div>' : ''}
         ${isTeamView ? `<div class="card-sub">工作区精确模型 Token 计价<br>当前用户对比 Token：<strong>${fmtNum(currentUserSummary?.tokens)}</strong></div>` : ''}
         ${renderMiniBars(modelStats)}
       </section>`;
@@ -5791,7 +5831,7 @@ function mountTeamUsagePanel(options = {}) {
       </table></div>` : '<div class="empty">所选范围内未找到模型用量明细。</div>'}
       ${modelStats.hasFallbackPricing ? '<div class="section-footnote">* 未知模型默认采用 GPT-5.5 费率进行估算。</div>' : ''}
       ${modelStats.rows.some((row) => isCodexAutoReviewModel(row.name)) ? '<div class="section-footnote">codex-auto-review 按 gpt-5.6-luna 映射估算（用户指定，非官方独立价格）。</div>' : ''}
-      ${modelStats.rows.some((row) => isImageModel(row.name)) ? `<div class="section-footnote">gpt-image-2/image2 使用图像模态专用费率估算；${modelStats.rows.some((row) => row.hasImageFieldFallback) ? '按可用字段估算，缺少明确图像输出模态拆分时可能不完整。' : '已按返回的明确模态字段计费。'} 计费参考：<a href="${GPT_IMAGE_2_PRICING_URL}" target="_blank" rel="noreferrer">OpenAI API Pricing</a></div>` : ''}
+      ${modelStats.rows.some((row) => isImageModel(row.name)) ? `<div class="section-footnote">GPT Image 2/2.5 使用图像模态专用参考费率估算；${modelStats.rows.some((row) => row.hasImageFieldFallback) ? '按可用字段估算，缺少明确图像输出模态拆分时可能不完整。' : '已按返回的明确模态字段计费。'} 计费参考：<a href="${GPT_IMAGE_2_PRICING_URL}" target="_blank" rel="noreferrer">OpenAI API Pricing</a></div>` : ''}
       ${isTeamView ? '<div class="section-footnote">无 Token 的模型活动行仅用于团队活动统计，不参与 Token 或费用计算。</div>' : ''}
     </section>`;
   const renderTeamOverview = (stats, modelActivity) => {
@@ -5878,6 +5918,10 @@ function mountTeamUsagePanel(options = {}) {
             const totals = row.totals || row;
             const open = state.expandedDates.has(row._dateKey);
             const models = asArray(row._tokenModels);
+            const dayCost = row._estimatedUsd !== null && row._estimatedUsd !== undefined
+              ? fmtUsd(row._estimatedUsd)
+              : row._knownEstimatedUsd !== null && row._knownEstimatedUsd !== undefined
+                ? fmtUsd(row._knownEstimatedUsd) + '（部分）' : '不可用';
             return `
               <tr class="daily-row ${open ? 'is-open' : ''}" data-action="toggle-day" data-date="${escapeHtml(row._dateKey)}" role="button" tabindex="0" aria-expanded="${open}">
                 <td>
@@ -5889,7 +5933,7 @@ function mountTeamUsagePanel(options = {}) {
                 <td class="num" title="${escapeHtml(fmtFullNum(tokenTotal(totals)))}">${fmtNum(tokenTotal(totals))}</td>
                 <td class="num">${fmtTurns(totals.turns)}</td>
                 <td class="num">${fmtTurns(totals.threads)}</td>
-                <td class="money">${isTeamView && !row._hasTeamTokenModels ? '不可用' : fmtUsd(row._estimatedUsd)}</td>
+                <td class="money">${isTeamView && !row._hasTeamTokenModels ? '不可用' : dayCost}</td>
               </tr>
               <tr class="details-row" data-role="day-details" ${open ? '' : 'hidden'}>
                 <td colspan="5">
